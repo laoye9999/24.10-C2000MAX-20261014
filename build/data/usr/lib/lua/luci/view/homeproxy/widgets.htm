@@ -1,0 +1,269 @@
+<%#
+ SPDX-License-Identifier: GPL-2.0
+ The running-status widgets, shared by the status page.
+ Split out of status.htm when the client settings were merged into it.
+ Everything here is read through the controller's `api` endpoint.
+-%>
+
+<%#
+ sing-box is a separate program, not a firmware component: some of these
+ devices ship it, some do not, and it is not in the opkg feeds either. That is
+ why the package no longer hard-depends on it -- a hard dependency turned
+ "you need one more file" into "the installer refuses to run at all". The cost
+ is that the package can now be installed without a working engine, so say so
+ here, on the page you land on first, instead of leaving a service that
+ silently fails to start.
+-%>
+<% if not require("nixio.fs").access("/usr/bin/sing-box") then %>
+<div class="cbi-map">
+	<fieldset class="cbi-section">
+		<legend><%:Missing dependency%></legend>
+		<div style="color:#c00;font-weight:bold"><%:sing-box is not installed.%></div>
+		<div class="cbi-value-description" style="margin-top:0.5em">
+			<%:The proxy cannot run without it. Install the sing-box package, then restart this service.%>
+		</div>
+	</fieldset>
+</div>
+<% end %>
+
+<%
+-- Memory, read straight out of /proc. Rendered server-side, so it is a
+-- snapshot: reload the page to refresh it. This exists because "the proxy
+-- uses a lot of memory" is otherwise impossible to confirm or disprove from
+-- the web UI on these boxes -- the vendor's own status page reports dashes.
+local function proc_read(path)
+	local fh = require("nixio.fs").readfile(path)
+	return fh
+end
+
+local function singbox_rss_kb()
+	local out = require("luci.sys").exec("pidof sing-box 2>/dev/null") or ""
+	local pid = out:match("%d+")
+	if not pid then return nil end
+	local status = proc_read("/proc/" .. pid .. "/status") or ""
+	return tonumber(status:match("VmRSS:%s*(%d+)%s*kB"))
+end
+
+local function meminfo_kb(key)
+	local text = proc_read("/proc/meminfo") or ""
+	return tonumber(text:match(key .. ":%s*(%d+)"))
+end
+
+local function fmt_mb(kb)
+	if not kb then return "—" end
+	return string.format("%.1f MB", kb / 1024)
+end
+
+local hp_rss   = singbox_rss_kb()
+local hp_total = meminfo_kb("MemTotal")
+local hp_avail = meminfo_kb("MemAvailable")
+%>
+
+<div class="cbi-map">
+	<fieldset class="cbi-section">
+		<legend><%:Service%></legend>
+		<div id="hp-state" class="cbi-value-description"><%:Checking…%></div>
+		<div class="cbi-value-description" style="margin-top:0.5em">
+			<%:Memory%>: sing-box <b><%=fmt_mb(hp_rss)%></b>
+			&nbsp;&nbsp;<%:Available%>: <b><%=fmt_mb(hp_avail)%></b> / <%=fmt_mb(hp_total)%>
+			<% if hp_total and hp_avail then %>
+			&nbsp;(<%=string.format("%.0f%%", hp_avail / hp_total * 100)%>)
+			<% end %>
+		</div>
+		<div style="margin-top:1em">
+			<!-- Markup and classes both matter on this theme:
+			       * <input>, not <button> -- cascade.css styles
+			         input.cbi-button*, so a <button> matches nothing and
+			         renders as bare text.
+			       * cbi-button-apply for all of them -- it is the only
+			         class this theme actually styles. cbi-button-reset is
+			         hidden outright (display:none !important) and
+			         cbi-button-action has no rules at all, so the Stop
+			         button would either vanish or stay unstyled. -->
+			<input type="button" class="cbi-button cbi-button-apply" value="<%:Start%>" onclick="hpAction('start')" />
+			<input type="button" class="cbi-button cbi-button-apply" value="<%:Stop%>" onclick="hpAction('stop')" />
+			<input type="button" class="cbi-button cbi-button-apply" value="<%:Restart%>" onclick="hpAction('restart')" />
+		</div>
+	</fieldset>
+
+	<fieldset class="cbi-section">
+		<legend><%:Traffic%></legend>
+		<div id="hp-traffic" class="cbi-value-description"><%:Waiting for data…%></div>
+	</fieldset>
+
+	<fieldset class="cbi-section">
+		<legend><%:Node%></legend>
+		<div id="hp-nodes"><%:Waiting for data…%></div>
+		<div id="hp-delay" class="cbi-value-description" style="margin-top:0.5em"></div>
+	</fieldset>
+
+	<fieldset class="cbi-section">
+		<legend><%:Active Connections%></legend>
+		<div id="hp-conns" style="max-height:22em;overflow:auto"></div>
+	</fieldset>
+</div>
+
+<script type="text/javascript">
+//<![CDATA[
+var HP_API    = '<%=luci.dispatcher.build_url("admin/services/homeproxy/api")%>';
+var HP_ACTION = '<%=luci.dispatcher.build_url("admin/services/homeproxy/action")%>';
+
+function hpFormatBytes(n) {
+	if (!n) return '0 B';
+	var u = ['B','KB','MB','GB','TB'], i = 0;
+	while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+	return n.toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
+}
+
+// Everything below is built as a string and handed to innerHTML, and the
+// two things that go into those strings are attacker-controlled: a node
+// name, which an imported subscription chooses, and a connection's host,
+// which is the SNI a LAN client asked for. Neither is trusted text. A node
+// named far from innocuous used to be written straight into the <option>
+// markup and execute in the router's own admin page.
+function hpEsc(s) {
+	return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+		return { '&': '&amp;', '<': '&lt;', '>': '&gt;',
+		         '"': '&quot;', "'": '&#39;' }[c];
+	});
+}
+
+// The path goes in `data`, never concatenated onto the URL.
+//
+// xhr.js's get() always appends its own `_=<random>` cache-buster, and it
+// joins with '?' unless the URL already ends in '&'. Handing it a URL that
+// already has a query string therefore produced
+// ".../api?path=%2Fproxies?_=0.5" -- the path arrived as "/proxies?_=0.5",
+// the controller rejected it, and the page reported "read failed (HTTP 200)"
+// because the reply was a 200 carrying /version's JSON instead. Passing the
+// parameter as data lets xhr.js encode both keys into one query string.
+function hpGet(path, cb) {
+	XHR.get(HP_API, { path: path }, function(x, data) {
+		if (!x || x.status !== 200 || !data) { cb(null, x ? x.status : 0); return; }
+		cb(data, 200);
+	});
+}
+
+// Say something when a fetch fails. Leaving the section reading
+// "Waiting for data…" forever looks like a broken page rather than a
+// transient error -- and during a service restart that window is normal.
+function hpFail(el, what, code) {
+	if (!el) return;
+	el.innerHTML = '<span style="color:#b00">' + what +
+		'：读取失败' + (code ? '（HTTP ' + code + '）' : '') + '</span>';
+}
+
+// XHR is a *constructor* here: get/post are instance methods, and only `get`
+// also exists as a static shortcut. Calling XHR.post(...) therefore throws
+// "XHR.post is not a function" and the click handler dies without a word.
+// Instantiate explicitly -- and fall back to the static form if some other
+// firmware build happens to provide it.
+function hpPost(url, data, cb) {
+	if (typeof XHR === 'function') {
+		new XHR().post(url, data, cb);
+	} else if (XHR && XHR.post) {
+		XHR.post(url, data, cb);
+	} else if (XHR && XHR.get) {
+		XHR.get(url, data, cb);
+	}
+}
+
+function hpAction(what) {
+	var state = document.getElementById('hp-state');
+	if (state) state.innerHTML = '<%:Working…%>';
+	hpPost(HP_ACTION, { action: what }, function() {
+		setTimeout(hpRefresh, 1200);
+	});
+}
+
+function hpRefresh() {
+	XHR.get(HP_ACTION, { action: 'service_status' }, function(x, st) {
+		var el = document.getElementById('hp-state');
+		if (!el) return;
+		if (x && x.status === 200 && st && st.running) {
+			el.innerHTML = '<span style="color:green;font-weight:bold"><%:Running%></span>';
+		} else {
+			el.innerHTML = '<span style="color:#b00;font-weight:bold"><%:Stopped%></span>';
+		}
+	});
+
+	hpGet('/connections', function(c, code) {
+		var t = document.getElementById('hp-traffic');
+		if (!c) { hpFail(t, '<%:Traffic%>', code); return; }
+		if (t) {
+			t.innerHTML = '<%:Downloaded%>: ' + hpFormatBytes(c.downloadTotal) +
+				' &nbsp;&nbsp; <%:Uploaded%>: ' + hpFormatBytes(c.uploadTotal) +
+				' &nbsp;&nbsp; <%:Connections%>: ' + (c.connections ? c.connections.length : 0);
+		}
+
+		var box = document.getElementById('hp-conns');
+		if (!box) return;
+		if (!c.connections) { hpFail(box, '<%:Active Connections%>', code); return; }
+		if (!c.connections.length) {
+			box.innerHTML = '<em><%:No active connections.%></em>';
+			return;
+		}
+		var rows = ['<table class="table" style="width:100%"><tr>' +
+			'<th><%:Host%></th><th><%:Source%></th><th><%:Rule%></th><th><%:Chain%></th></tr>'];
+		for (var i = 0; i < c.connections.length && i < 100; i++) {
+			var m = c.connections[i].metadata || {};
+			var chain = (c.connections[i].chains || []).join(' → ');
+			rows.push('<tr><td>' + hpEsc(m.host || m.destinationIP || '?') + '</td>' +
+				'<td>' + hpEsc(m.sourceIP || '') + '</td>' +
+				'<td>' + hpEsc(c.connections[i].rule || '') + '</td>' +
+				'<td>' + hpEsc(chain) + '</td></tr>');
+		}
+		rows.push('</table>');
+		box.innerHTML = rows.join('');
+	});
+
+	hpGet('/proxies', function(p, code) {
+		var box = document.getElementById('hp-nodes');
+		if (!box) return;
+		if (!p || !p.proxies) { hpFail(box, '<%:Node%>', code); return; }
+
+		var sel = p.proxies['proxy'];
+		if (!sel || !sel.all) {
+			box.innerHTML = '<em><%:No node configured. Add one on the Node Settings page.%></em>';
+			return;
+		}
+
+		var html = ['<select id="hp-node-select" onchange="hpPick(this.value)" style="min-width:16em">'];
+		for (var i = 0; i < sel.all.length; i++) {
+			var n = sel.all[i];
+			var active = (n === sel.now) ? ' selected="selected"' : '';
+			html.push('<option value="' + hpEsc(n) + '"' + active + '>' +
+				hpEsc(n) + '</option>');
+		}
+		html.push('</select> ');
+		html.push('<input type="button" class="cbi-button cbi-button-apply" value="<%:Test Latency%>" onclick="hpTest()" />');
+		box.innerHTML = html.join('');
+	});
+}
+
+function hpPick(name) {
+	hpPost(HP_ACTION, { action: 'select', node: name }, function() {
+		var el = document.getElementById('hp-delay');
+		if (el) el.innerHTML = '';
+	});
+}
+
+function hpTest() {
+	var el = document.getElementById('hp-delay');
+	var sel = document.getElementById('hp-node-select');
+	if (!el || !sel) return;
+	el.innerHTML = '<%:Testing…%>';
+	hpGet('/proxies/' + encodeURIComponent(sel.value) +
+		'/delay?url=http://www.gstatic.com/generate_204&timeout=5000', function(d) {
+		if (d && d.delay) {
+			el.innerHTML = '<%:Latency%>: ' + d.delay + ' ms';
+		} else {
+			el.innerHTML = '<span style="color:#b00"><%:Unreachable%></span>';
+		}
+	});
+}
+
+hpRefresh();
+setInterval(hpRefresh, 5000);
+//]]>
+</script>

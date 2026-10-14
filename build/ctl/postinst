@@ -1,0 +1,64 @@
+#!/bin/sh
+# First-install setup runs once and is then removed, so a later boot cannot
+# re-run it and clobber settings the user has since changed.
+if [ -f /etc/uci-defaults/luci-homeproxy ]; then
+	sh /etc/uci-defaults/luci-homeproxy >/dev/null 2>&1
+	rm -f /etc/uci-defaults/luci-homeproxy
+fi
+
+# /etc/config/homeproxy is a conffile: opkg keeps the user's copy, so a section
+# added to the package's default config never reaches an existing install.
+# The subscription page hangs its page-level controls off this placeholder, so
+# bring it forward explicitly.
+if [ -f /etc/config/homeproxy ]; then
+	uci -q get homeproxy.actions >/dev/null 2>&1 || {
+		uci set homeproxy.actions=actions >/dev/null 2>&1
+		uci commit homeproxy >/dev/null 2>&1
+	}
+
+	# Same conffile problem for the rule-set base. An install that predates the
+	# local-file change still points at cdn.jsdelivr.net, which is RST'd here,
+	# so the remote fallback would be dead on arrival. Only the known-bad value
+	# is replaced -- a base the user chose themselves is left alone.
+	if [ "$(uci -q get homeproxy.dns.rule_set_base)" = \
+			"https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo" ]; then
+		uci set homeproxy.dns.rule_set_base='https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo' >/dev/null 2>&1
+		uci set homeproxy.dns.rule_set_dir='/etc/homeproxy/rule_set' >/dev/null 2>&1
+		uci commit homeproxy >/dev/null 2>&1
+	fi
+
+	# The rule sets themselves ship with the package, so after a clean install
+	# there is nothing to do. A file that is missing -- hand-deleted, or never
+	# unpacked -- is fatal at sing-box startup, though, and cannot be told from
+	# a good one without reading it. So check for the missing case alone and
+	# re-fetch in the background: a slow mirror must not hold up the install.
+	mkdir -p /etc/homeproxy/rule_set
+	rs_missing=0
+	for rs in geoip-cn geosite-cn geosite-geolocation-!cn; do
+		[ -s "/etc/homeproxy/rule_set/$rs.srs" ] || rs_missing=1
+	done
+	if [ "$rs_missing" = "1" ] && [ -x /usr/share/homeproxy/update-rule-sets.sh ]; then
+		logger -t homeproxy "rule sets missing after install, fetching in the background"
+		/usr/share/homeproxy/update-rule-sets.sh --force >/dev/null 2>&1 &
+	fi
+fi
+
+# Upgrades run prerm first, which stops the service. If it was switched on,
+# put it back -- otherwise an upgrade quietly leaves the user without a proxy
+# and without boot-time autostart.
+if [ "$(uci -q get homeproxy.global.enabled)" = "1" ] && [ -x /etc/init.d/homeproxy ]; then
+	/etc/init.d/homeproxy enable >/dev/null 2>&1
+	/etc/init.d/homeproxy start >/dev/null 2>&1
+fi
+
+# Make the new pages show up without a reboot.
+#
+# LuCI's dispatcher caches the menu index as /tmp/luci-indexcache.<hash>.json,
+# keyed on the hash of the controller file list -- so a bare
+# `rm -f /tmp/luci-indexcache` removes nothing on this LuCI version. The hash
+# does change when a controller is added, so the new entry would appear anyway;
+# clearing the family explicitly just makes it immediate and also covers the
+# upgrade case, where the file list is unchanged but the pages are not.
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*.json /tmp/luci-modulecache/* 2>/dev/null
+
+exit 0

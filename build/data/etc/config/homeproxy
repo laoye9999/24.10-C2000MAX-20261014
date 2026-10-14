@@ -1,0 +1,64 @@
+config global 'global'
+	option enabled '0'
+	# rule   = 国内直连、国外走代理
+	# global = 全部走代理
+	# direct = 全部直连（只做 DNS 处理）
+	option proxy_mode 'rule'
+	option default_node ''
+	option log_level 'warn'
+	option tcp_fast_open '1'
+	option sniff '1'
+	# 用嗅探出的域名作为实际拨号目标，而不是客户端连的那个 IP。
+	# 必须开着：局域网客户端的 DNS 由 dnsmasq 解析，国外域名会拿到被污染的
+	# 地址，关掉的话代理会去连这个假地址，表现为"国内正常、国外全部超时"。
+	option sniff_override '1'
+	# 一并接管 IPv6。本机从运营商拿到的是公网 v6 前缀，客户端会优先走 v6，
+	# 而 v6 一旦不被接管就等于绕过了代理——被墙的站点会直接打不开，而不是
+	# 退回走已代理的 IPv4。设成 '0' 可以只代理 IPv4。
+	option ipv6 '1'
+	# 拦截局域网客户端发往 53 端口的查询，交给 sing-box 解析，避免用被污染的
+	# 答案去连被墙的站点。
+	#
+	# 但本机固件用 dns_redirect=1 把所有 UDP 53 查询强制转给路由器自己的
+	# dnsmasq（nat prerouting，优先级 -95，比 TPROXY 的 mangle -150 晚）。同一
+	# 条查询被两处处理时，回复对不上 conntrack 记下的映射，客户端会一直等到
+	# 超时。所以 firewall.sh 让路：固件接管 UDP 53 时就不碰它（DNS 由 dnsmasq
+	# 回答，被污染的域名靠 sniff_override 从 TLS 握手还原真实域名），TCP 53
+	# 固件不管，仍然由 sing-box 回答。
+	#
+	# 设成 '0' 表示连 TCP 53 也不拦截。
+	option dns_hijack '1'
+	# Clash API，LuCI 状态页和节点切换靠它
+	option clash_api '1'
+	option clash_port '9090'
+	# direct 出口的 SO_MARK；与 TPROXY 的 mark(1) 必须不同
+	option routing_mark '2'
+
+config inbound 'inbound'
+	option tproxy_port '5330'
+	option lan_interface 'br-lan'
+	option udp_timeout '5m'
+
+# 纯界面用途的占位段：LuCI 的 SimpleSection 的 section 是 nil，放 Button /
+# DummyValue 会在保存时崩溃（cbi.lua:1364 attempt to concatenate 'section'）。
+# 订阅页的「全部更新」按钮和结果面板挂在这个真实存在的段上。
+config actions 'actions'
+	option _placeholder '1'
+
+config dns 'dns'
+	option strategy 'prefer_ipv4'
+	option local_dns '223.5.5.5'
+	option remote_dns 'https://1.1.1.1/dns-query'
+	# 分流规则集（geoip-cn / geosite-cn / geosite-geolocation-!cn）随包附带在
+	# rule_set_dir 里，sing-box 直接用本地文件，启动不依赖网络。
+	#
+	# 这是必须的，不是优化：sing-box 在启动阶段解析 remote 规则集，下载失败就
+	# 直接退出。而 cdn.jsdelivr.net 在国内被 RST，所以只要真配了节点、又用
+	# rule 模式，sing-box 永远起不来——procd 反复重试成崩溃循环，界面上看就是
+	# "点了启动没反应"。
+	#
+	# rule_set_base 只在本地文件缺失时才作为兜底，以及给下面的刷新脚本用。
+	# 默认填的是国内可达的 jsDelivr 镜像（cdn.jsdelivr.net 那个主机名被墙）。
+	option rule_set_base 'https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo'
+	option rule_set_interval '7d'
+	option rule_set_dir '/etc/homeproxy/rule_set'

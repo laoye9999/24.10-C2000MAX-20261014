@@ -1,0 +1,151 @@
+Package: luci-app-homeproxy
+Version: 1.0.0-r30
+Depends: libc, lua, luci-base, luci-compat, luci-lib-jsonc, libuci-lua, ucode-mod-lua, sing-box, iptables, ip6tables, kmod-nft-tproxy, kmod-ipt-tproxy, kmod-nft-compat, ip-full, curl, ca-bundle
+Source: homeproxy-2410
+SourceName: luci-app-homeproxy
+License: GPL-2.0
+Section: luci
+Architecture: aarch64_cortex-a53
+Installed-Size: 149646
+Description: 走进科学 (HomeProxy, ImmortalWrt 24.10 / firewall4 targets)
+ A sing-box based transparent proxy, rewritten natively in Lua for the
+ ImmortalWrt 24.10 generation: Lua CBI frontend, Lua configuration
+ generator, and iptables TPROXY rules installed into the nft ruleset.
+ .
+ The upstream package needs the JavaScript LuCI client and ucode; this one
+ runs against luci-compat's Lua dispatcher and needs only the sing-box
+ binary, which it depends on rather than re-shipping. The original r23 build
+ bundled its own copy of the binary and declared `Replaces: sing-box`, which
+ had two packages owning /usr/bin/sing-box at once -- removing either one
+ then deleted the engine the other was using.
+ .
+ Both the iptables TPROXY targets and the nft compat layer are declared
+ because this firmware's iptables is the nft-backed wrapper: how the target
+ is expressed differs, and which kernel module backs it depends on that.
+ .
+ Both IPv4 and IPv6 are captured; IPv6 can be disabled with
+ `uci set homeproxy.global.ipv6=0`.
+ .
+ Two properties of the target firmware are handled explicitly rather than
+ assumed away. Its eqos service flushes the entire mangle PREROUTING chain on
+ every interface event, so a resident guard watches the rules and re-installs
+ them when it finds them gone. And its dns_redirect sends every UDP port-53
+ query to the router's own dnsmasq; the rules step aside for that instead of
+ competing with it, because a second handler for the same query leaves the
+ reply outside what conntrack recorded and the client waits forever.
+ .
+ The guard is also what keeps the rules off a dead proxy. TPROXY rules in
+ front of a port nobody is listening on are worse than no rules at all: the
+ packet is dropped with no RST and no ICMP, so the LAN loses every foreign
+ destination instead of falling back to the ordinary route. The guard pulls
+ the rules after 20 seconds without a listener, puts them back when it
+ returns, and -- because procd gives up after five crashes -- asks for a
+ restart itself, at most three times per healthy period.
+ .
+ Three defects the frontend had are fixed in this build. The DNS strategy
+ dropdown never reached the generated config: the generator read an option
+ named `dns_strategy` that exists nowhere, so every choice fell through to
+ the built-in default. A node name containing a space, a `#` or non-ASCII
+ characters -- which includes the name the importer gives a duplicate --
+ was rejected by two controller whitelists, leaving the node unselectable
+ and untestable; both now accept what the page actually sends, and the
+ status page escapes node names and connection hosts on the way into
+ innerHTML. And the node page's collapse, latency test and sorting were
+ inert, because their selector looked for a `fieldset` where this
+ firmware's CBI templates render a `div`.
+ .
+ r27 fixes a deadlock the r25 watch phase introduced. rc.common takes procd's
+ per-service lock on fd 1000 in start() and expects it back when the process
+ that took it exits -- which a resident guard never does. The lock was
+ therefore held for the whole life of the service, and every later stop(),
+ reload() and opkg prerm -- all of which call procd_lock and block on the
+ second, blocking flock when the non-blocking attempt fails -- waited on it
+ forever. It also made the guard's own recovery path unreachable, since the
+ restart it asks for is exactly the call that deadlocked. The guard now closes
+ fd 1000 at startup. Upgrading from r26 or earlier needs the running guard
+ killed by hand first, or this very bug will hang the prerm.
+ .
+ r28 is the result of an audit of the package against the running system.
+ Eight further defects, each confirmed against the code and the device:
+ .
+ The guard's acquire conditions were latched -- once the port had been seen
+ listening it was never tested again -- so a listener that died before the WAN
+ came up still authorised the install, putting the full capture in front of a
+ closed port and logging that the proxy was listening. They are re-read every
+ tick now. The hotplug hook gated on `pidof sing-box`, which is true for the
+ whole of a stop window (stop_service removes guard.pid and then runs
+ firewall.sh down, and rc.common does not kill the service until it returns),
+ so an interface event in that window re-installed the rules in front of a
+ proxy being stopped, and for a plain stop nothing ever removed them again;
+ it now tests the tproxy port, as the guard does. And stop_guard collected the
+ guard's children before signalling it, so an `up` forked in that gap survived
+ and rebuilt the rules after `down`; the guard is SIGSTOPped across the
+ collection now.
+ .
+ The rule-set refresher stamped its throttle unconditionally, so a run in
+ which every mirror failed -- the six-hourly cron during a reboot, or the
+ postinst fetch with no WAN -- suppressed the next attempt for a week, which
+ is also the only automatic repair path for a missing or truncated file. It
+ stamps only on success. Its downloads shared one fixed temp path with no
+ lock, so two overlapping runs could install a byte-mix of two downloads that
+ passes the size and magic check and then fails inside sing-box; the temp name
+ is per-process and the script takes a lock. And it restarted the whole service
+ on every changed rule set, which it need not: verified on the device that
+ sing-box watches the rule-set directory and reloads on the rename the script
+ performs.
+ .
+ confgen now guards the two places where unvalidated input could stop the core
+ from starting. Its duplicate-tag disambiguation never covered the generator's
+ own tags, so a node named `direct`, `block` or `proxy` produced a duplicate
+ outbound and sing-box exited during construction -- one node, not two. And
+ rule_set_interval is free text from a CBI field with no datatype, emitted into
+ a `type: remote` fallback that exists to make startup more robust; an
+ unparseable value there fails config decode, so it is validated now.
+ .
+ The Update buttons on the subscription page ran the whole fetch synchronously
+ inside the LuCI request, so a stalled or black-holed provider URL produced a
+ 502 from uhttpd's 60s script_timeout while the fetch ran on unwatched as a
+ grandchild; they start it detached and the page's existing log pane reports
+ progress. subscribe.lua itself took no lock, so two overlapping runs could
+ lose the nodes one of them had just imported while still advancing that
+ subscription's last_update and suppressing the next attempt; it takes one now.
+ A hysteria2 node typed in by hand had its Obfs Password saved and then
+ dropped, because the generator required an obfs_type that only the link parser
+ ever sets.
+ .
+ r29 fixes a doubled tab strip. The package draws its own child-page navigation
+ because the vendor theme renders none, but some themes render one, and this
+ device runs one of those: argon ships an empty <div id="tabmenu"> in its header
+ and fills it from the menu tree in JavaScript, so every homeproxy page showed
+ that strip with this package's own stacked underneath -- five entries above,
+ four below. The strip now stands down whenever the active theme draws its own.
+ The test reads the theme's header, which is where both mechanisms are anchored:
+ a server-side theme loops over node_childs there, and a client-side one puts
+ the container there for its renderer to find. When the theme cannot be
+ identified it still renders -- a missing strip leaves the five pages reachable
+ only by typing URLs, while a duplicate is merely ugly, so that is the direction
+ to be wrong in.
+ .
+ r30 makes the node page's collapsed line say what it collapsed. Each node was
+ already folded to one summary row, but that row never showed a node's name,
+ because CBI does not put the value on the element it gives the id to: the id
+ goes on a wrapper div -- `<div id="cbid.homeproxy.<section>.name">` -- and
+ /luci-static/resources/cbi.js builds the real control *inside* it at runtime.
+ Reading `.value` off the id'd element read it off a div, where it is
+ undefined, so every node summarised as "(unnamed)" with no address -- which
+ is what the feature not being there at all looks like. The summary descends
+ to the control now, shows the node's type beside its name, and is rewritten
+ once those controls exist: cbi.js builds them only after luci.js has finished
+ a probe of the RPC endpoint, a network round trip after DOMContentLoaded, so
+ at the moment the row is created there is genuinely nothing on the page to
+ read. It is rewritten on edits too, through a delegated listener, instead of
+ leaving the old name behind.
+ .
+ Two smaller defects in the same file. Sorting moved the node bodies but not
+ their Delete buttons, because tsection.htm emits a section's Delete in a
+ sibling div *before* it: after a TCP sweep reordered the list, every Delete
+ button sat next to the wrong node, and pressing it would have removed the
+ wrong server. The pair moves together now, and the sorted list is inserted
+ before the section's Add button rather than past it. And the whole list opens
+ or closes from one button that always offers whichever action the list is not
+ already in.

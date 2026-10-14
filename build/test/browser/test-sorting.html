@@ -1,0 +1,55 @@
+<!doctype html><meta charset=utf-8><title>pending</title>
+<body><pre id=out>pending</pre>
+<script>
+var log=[]; function say(s){log.push(s);document.getElementById('out').textContent=log.join('\n');}
+var f=document.createElement('iframe');
+f.style.cssText='width:1100px;height:900px;border:0'; f.src='/page.html';
+document.body.appendChild(f);
+f.onload=function(){ setTimeout(function(){run(f.contentDocument);}, 6000); };
+
+function order(d){
+  var sec=d.getElementById('cbi-homeproxy-node');
+  var out=[];
+  for(var c=sec.firstElementChild;c;c=c.nextElementSibling){
+    if(c.className.indexOf('cbi-section-remove')!==-1){
+      var m=(c.querySelector('input[name^="cbi.rts."]')||{name:'?'}).name.split('.');
+      out.push('REMOVE('+m[3]+')');
+    } else if(c.className.indexOf('cbi-section-node')!==-1){
+      out.push('NODE('+c.id.replace('cbi-homeproxy-','')+')');
+    }
+  }
+  return out;
+}
+
+function run(d){
+  try{
+    var first=d.querySelector('.cbi-section-node[id^="cbi-homeproxy-cfg"]');
+    var rm=first.previousElementSibling;
+    var cloneN=first.cloneNode(true), cloneR=rm.cloneNode(true);
+    cloneN.id='cbi-homeproxy-cfgdead01';
+    cloneN.removeAttribute('data-hp-done');
+    cloneR.querySelector('input').name='cbi.rts.homeproxy.cfgdead01';
+    rm.parentNode.insertBefore(cloneR, first.nextSibling);
+    first.parentNode.insertBefore(cloneN, cloneR.nextSibling);
+    say('before: '+order(d).join(' '));
+
+    var s=d.createElement('script'); s.src='/luci-static/homeproxy/node.js?'+Math.random();
+    d.body.appendChild(s);
+
+    setTimeout(function(){
+      say('after : '+order(d).join(' '));
+      var seq=order(d), ok=true;
+      for(var i=0;i<seq.length;i+=2){
+        var a=seq[i]||'', b=seq[i+1]||'';
+        if(a.indexOf('REMOVE(')!==0||b.indexOf('NODE(')!==0||
+           a.slice(7,-1)!==b.slice(5,-1)){ ok=false; }
+      }
+      say('pairing: '+(ok?'OK every Delete sits with its own node':'BROKEN '+seq.join(' ')));
+      say('sorted: '+(seq[0]==='REMOVE(cfgdead01)'?'OK fastest node moved to the top':'NOT SORTED'));
+      var all=d.querySelectorAll('.cbi-section-node[id^="cbi-homeproxy-cfg"]');
+      say('nodes now: '+all.length+'  headers: '+d.querySelectorAll('.hp-node-head').length);
+    }, 8000);
+  }catch(e){ say('EXCEPTION: '+e); }
+  document.title='done';
+}
+</script>

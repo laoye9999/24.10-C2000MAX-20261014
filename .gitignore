@@ -1,0 +1,9 @@
+# macOS
+.DS_Store
+
+# Local scratch
+63.png
+
+# Earlier builds, kept locally only
+old/
+luci-app-homeproxy_1.0.0-r23_aarch64_cortex-a53.ipk

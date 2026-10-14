@@ -1,0 +1,253 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0
+# homeproxy 21.02 backport -- service control.
+#
+# procd supervises sing-box. The firewall is deliberately installed *after* the
+# proxy is confirmed listening, never before: TPROXY rules pointing at a closed
+# port would black-hole every LAN client until someone noticed.
+#
+# The guard that installs them then stays resident and keeps the two in step
+# for as long as the service runs -- see firewall-guard.sh for why "installed
+# once, at the right moment" was not enough.
+
+START=99
+STOP=10
+USE_PROCD=1
+
+NAME=homeproxy
+HP_DIR=/usr/share/homeproxy
+CONFIG_OUT=/var/run/homeproxy/config.json
+PIDFILE=/var/run/homeproxy/sing-box.pid
+GUARD_PID=/var/run/homeproxy/guard.pid
+
+log() { logger -t homeproxy "$*"; }
+
+start_service() {
+	config_load homeproxy
+
+	# The vendor-theme marker hack that used to live here has been removed.
+	#
+	# It wrote empty files under /tmp/appcenter/luci/ so that NRadio's
+	# header.htm would treat these pages as "inner pages" and not draw its
+	# own navigation bar a second time. On this firmware that directory does
+	# not exist and nothing anywhere references "appcenter": the theme in
+	# use is upstream LuCI (argon / bootstrap), not the vendor shell the hack
+	# was written against. It created six empty files per boot that no code
+	# ever read.
+	#
+	# If a future firmware reintroduces a vendor header that needs marking,
+	# that is a theme problem and belongs in the theme, not in the service
+	# that happens to start after it.
+
+	local enabled
+	config_get_bool enabled global enabled 0
+	if [ "$enabled" != "1" ]; then
+		log "disabled in /etc/config/homeproxy, not starting"
+		return 0
+	fi
+
+	# sing-box is a separate program, not a firmware component, and the package
+	# deliberately does not hard-depend on it (a hard dependency made the
+	# installer refuse to run at all on devices that lack it). Without this
+	# guard procd would just respawn-loop against a binary that is not there.
+	if [ ! -x /usr/bin/sing-box ]; then
+		log "sing-box is not installed at /usr/bin/sing-box; install it first, not starting"
+		return 0
+	fi
+
+	mkdir -p /var/run/homeproxy /etc/homeproxy
+
+	# Anything left over from a previous run would conflict.
+	"$HP_DIR/firewall.sh" down >/dev/null 2>&1
+
+	# sing-box binds its outbounds to the default interface. Starting before
+	# the WAN has one -- a cold boot behind a modem -- makes it log "missing
+	# default interface" and fail every dial with "no route to host".
+	#
+	# This used to wait up to 15s. On this device that was a straight loss:
+	# homeproxy is S99 and so is modeminit, which sorts after it, so the wait
+	# sat in front of *the step that brings the 5G uplink up* -- the very thing
+	# it was waiting for. Nothing was bought either: sing-box re-detects the
+	# interface on its own once it appears, and what decides whether the LAN
+	# gets captured is firewall-guard.sh's three-condition gate, not this.
+	# One second is kept only to absorb the common first-tick race.
+	if ! wait_for_wan 1; then
+		log "no default route yet, starting anyway (guard will wait)"
+	fi
+
+	if ! lua /usr/lib/lua/homeproxy/gen_config.lua "$CONFIG_OUT"; then
+		log "configuration generation failed, not starting"
+		return 1
+	fi
+
+	# sing-box is Go, and Go's default GOGC=100 lets the heap grow to twice the
+	# live set before collecting -- on a router that is the difference between
+	# roughly 40MB and 90MB resident for the same workload.
+	#
+	# GOMEMLIMIT is the lever, and it is inherently safe: it is a *soft* limit.
+	# Go collects more eagerly as it approaches it and simply exceeds it if it
+	# must, so a value set too low costs CPU, never an OOM kill.
+	#
+	# The value is derived from this device's RAM rather than hardcoded,
+	# because these NRadio boxes range from 256MB to 1GB. Override with
+	# `uci set homeproxy.global.go_memlimit=64MiB`, or "off" to leave Go alone.
+	local memlimit
+	config_get memlimit global go_memlimit ""
+	if [ "$memlimit" = "off" ]; then
+		memlimit=""
+	elif [ -z "$memlimit" ]; then
+		local mem_total_kb
+		mem_total_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)
+		if [ -n "$mem_total_kb" ] && [ "$mem_total_kb" -gt 0 ] 2>/dev/null; then
+			# An eighth of RAM, clamped: below 48MiB the GC starts working
+			# against live data and burns CPU for nothing, and above 128MiB
+			# there is no point on a box this size.
+			local limit_mb=$((mem_total_kb / 1024 / 8))
+			[ "$limit_mb" -lt 48 ] && limit_mb=48
+			[ "$limit_mb" -gt 128 ] && limit_mb=128
+			memlimit="${limit_mb}MiB"
+		else
+			memlimit="64MiB"
+		fi
+	fi
+
+	local go_env="GOGC=50"
+	[ -n "$memlimit" ] && go_env="$go_env GOMEMLIMIT=$memlimit"
+
+	procd_open_instance
+	# Wrapped in sh -c rather than using procd_set_param env: the wrapper works
+	# on every procd, needs nothing beyond /bin/sh, and `exec` keeps the PID so
+	# procd's respawn and stop still apply to sing-box itself.
+	procd_set_param command /bin/sh -c "$go_env exec /usr/bin/sing-box run -c '$CONFIG_OUT'"
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	# Restart on crash, but give up after 5 failures so a bad config does not
+	# spin forever.
+	procd_set_param respawn 3600 5 5
+	procd_close_instance
+
+	# The rules are NOT installed here.
+	#
+	# procd_close_instance only *registers* the instance; procd launches the
+	# process after start_service() returns. Installing the rules at this point
+	# puts them in front of a port that is not listening yet, and every LAN
+	# client is pointed at a closed socket until sing-box binds -- the "no
+	# internet right after connecting" failures. The guard waits for the port
+	# and installs the rules then, or installs nothing at all.
+	start_guard
+
+	log "started"
+}
+
+# Block (bounded) until the WAN has a default route.  Defaults to a single
+# tick; see the caller for why a long wait is counter-productive here.
+wait_for_wan() {
+	local limit=${1:-1}
+	local i=0
+	while [ "$i" -lt "$limit" ]; do
+		if ip route show default 2>/dev/null | grep -q .; then
+			return 0
+		fi
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+# Install the firewall rules once the proxy can serve them, keep them in step
+# with it afterwards, and pull them if it dies. Detached, and given a pidfile
+# so stop_service can cancel it.
+start_guard() {
+	local port
+	config_get port inbound tproxy_port 5330
+
+	stop_guard
+
+	# 180s is only the *acquire* window -- how long to wait for the port, the
+	# WAN and a working resolver before installing for the first time. It is
+	# not a lifetime: past it the guard stays resident and keeps watching,
+	# which is what the pidfile and the hotplug hook's `kill -0` are for. The
+	# wait is generous because this device's modem can take minutes to
+	# produce a default route.
+	start-stop-daemon -S -b -m -p "$GUARD_PID" \
+		-x /usr/share/homeproxy/firewall-guard.sh -- "$port" 180
+}
+
+stop_guard() {
+	[ -f "$GUARD_PID" ] || return 0
+
+	# Collect the children *before* killing the guard: once it is gone they
+	# are reparented to init and `pgrep -P <guard-pid>` finds nothing.
+	#
+	# Freeze it first, or the list is not guaranteed to be complete. pgrep and
+	# the kill below are two separate moments and the guard is not blocked in
+	# between -- it forks on every tick (`netstat`, `ip route`, `nslookup`, and
+	# firewall.sh while it is retrying an install). A child forked after the
+	# pgrep survives, is reparented to init when the guard dies, and runs to
+	# completion: a firewall.sh already inside `up` then rebuilds the mangle
+	# chain, the PREROUTING jump and the policy route *after* stop_service's
+	# `down`, in front of a proxy that has just been stopped, with nothing left
+	# to remove them. SIGSTOP closes that window instead of narrowing it -- a
+	# stopped process cannot fork. The TERM queued while it is stopped is
+	# delivered on the CONT, so the guard still exits normally.
+	local gpid kids
+	gpid=$(cat "$GUARD_PID" 2>/dev/null)
+	kids=""
+	if [ -n "$gpid" ]; then
+		kill -STOP "$gpid" 2>/dev/null
+		kids=$(pgrep -P "$gpid" 2>/dev/null)
+	fi
+
+	start-stop-daemon -K -p "$GUARD_PID" >/dev/null 2>&1
+	[ -n "$gpid" ] && kill -CONT "$gpid" 2>/dev/null
+
+	# The guard runs firewall.sh as a child, and killing only the guard left
+	# that child alive. A firewall.sh already inside `up` then finished
+	# *after* stop_service's `down`, reinstalling the mangle chain, the
+	# PREROUTING jump and the policy route in front of a sing-box that had
+	# just been stopped -- TPROXY rules pointing at a closed port, which
+	# black-holes every LAN flow to a public address until someone runs
+	# `down` by hand. Stopping or reloading the service during a cold boot
+	# is exactly when the guard is most likely to be mid-install.
+	if [ -n "$kids" ]; then
+		# Deliberately unquoted: $kids is a list of pids.
+		# shellcheck disable=SC2086
+		kill $kids 2>/dev/null
+		# One second, and only when there was actually something to kill,
+		# so the ordinary stop and reload paths are not delayed. The file
+		# takes no lock, so this is a grace period rather than a guarantee --
+		# but a script killed here is at most one iptables call from
+		# finishing, and the `down` that follows removes whatever it managed
+		# to add either way.
+		sleep 1
+	fi
+
+	rm -f "$GUARD_PID"
+}
+
+stop_service() {
+	stop_guard
+	"$HP_DIR/firewall.sh" down >/dev/null 2>&1
+	rm -f "$CONFIG_OUT" "$PIDFILE"
+	log "stopped"
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "homeproxy"
+
+	# Deliberately no procd_add_interface_trigger here.
+	#
+	# It was meant to catch a WAN arriving after us, but registering it made
+	# procd fire it immediately and the service restarted in a loop. Two
+	# firewall.sh runs then overlapped, and because that script uses `set -e`
+	# the loser aborted halfway -- leaving the mangle chain created but with no
+	# PREROUTING jump and no policy route, i.e. a torn-down proxy that still
+	# looked half-installed. wait_for_wan handles the ordinary cold-boot case;
+	# a WAN that appears later needs a manual restart, which is a far better
+	# trade than a boot loop.
+}

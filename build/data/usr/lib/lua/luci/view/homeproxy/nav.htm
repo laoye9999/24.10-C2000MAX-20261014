@@ -1,0 +1,78 @@
+<%#
+ SPDX-License-Identifier: GPL-2.0
+ Page navigation for the homeproxy pages.
+
+ Why this file exists at all: the vendor's theme renders no child-page tab menu
+ -- its header hard-codes NRadio's own navigation and uses disp.node_childs only
+ as a condition -- so without this the five pages would be reachable only by
+ typing URLs.
+
+ The markup is copied from how NRadio marks up its own multi-page settings
+ (view/nradio_wifi/config.htm), so it inherits their styling exactly --
+ `cbi-tab` for the page you are on, `cbi-tab-disabled` for the others. No new
+ classes, colours or CSS are introduced.
+
+ `hidden-xs` matches the vendor: they hide this strip on phones, where the
+ hamburger menu is the expected way around.
+
+ BUT some themes do render the strip themselves, and then this is a *second*
+ one stacked under the first. Argon is that case, and it is what this device
+ runs: argon's header ships an empty `<div id="tabmenu">` and its
+ /luci-static/resources/menu-argon.js fills it from the menu tree at runtime,
+ drawing all five children -- including `import`, which this list has never had.
+ The result was two tab strips on every page, one with five entries and one
+ with four.
+
+ So: draw only when the active theme does not. Both mechanisms anchor in the
+ theme's own header -- a server-side theme loops over disp.node_childs there,
+ and a client-side one puts the container there for its renderer to find -- so
+ the header is what gets tested. When the theme cannot be identified this
+ renders: a missing strip leaves the pages reachable only by URL, while a
+ duplicate is merely ugly, and that is the direction to be wrong in.
+-%>
+
+<%
+	local disp      = require "luci.dispatcher"
+	local translate = require("luci.i18n").translate
+
+	local function theme_draws_tabs()
+		local ok, uci = pcall(require, "uci")
+		if not ok then return false end
+
+		local base = uci.cursor():get("luci", "main", "mediaurlbase") or ""
+		local theme = base:match("([^/]+)/*$")
+		if not theme or theme == "" then return false end
+
+		local f = io.open("/usr/lib/lua/luci/view/themes/" .. theme .. "/header.htm")
+		if not f then return false end
+		local header = f:read("*a")
+		f:close()
+		if not header then return false end
+
+		return header:find("node_childs", 1, true) ~= nil
+			or header:find('id="tabmenu"', 1, true) ~= nil
+	end
+
+	-- The last path segment names the page. A bare .../homeproxy lands on
+	-- status via firstchild(), so treat it as status too.
+	local here = disp.context.path[#disp.context.path]
+	if not here or here == "homeproxy" then here = "status" end
+
+	local pages = {
+		{ "status",       "Running Status" },
+		{ "node",         "Node Settings" },
+		{ "subscription", "Subscription" },
+		{ "log",          "Logs" },
+	}
+%>
+<% if not theme_draws_tabs() then %>
+<ul class="cbi-tabmenu hidden-xs">
+<% for _, p in ipairs(pages) do %>
+<% if p[1] == here then %>
+	<li class="cbi-tab"><a href="#"><%=translate(p[2])%></a></li>
+<% else %>
+	<li class="cbi-tab-disabled"><a href="<%=disp.build_url("admin", "services", "homeproxy", p[1])%>"><%=translate(p[2])%></a></li>
+<% end %>
+<% end %>
+</ul>
+<% end %>

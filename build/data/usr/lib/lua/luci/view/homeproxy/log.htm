@@ -1,0 +1,83 @@
+<%#
+ SPDX-License-Identifier: GPL-2.0
+ sing-box writes to stdout, which procd forwards to the system log, so the
+ log is read back out of whatever the platform uses for that. Which is not
+ the same thing on every firmware -- see the source list below.
+-%>
+
+<%+header%>
+
+<%+homeproxy/nav%>
+
+<h2 name="content"><%:HomeProxy Logs%></h2>
+
+<%
+	local sys = require "luci.sys"
+	local fs = require "nixio.fs"
+
+	-- Where the system log lives depends on which syslog daemon is running.
+	--
+	-- Stock OpenWrt runs logd and keeps a ring buffer that `logread` reads.
+	-- The NRadio firmware these packages target runs rsyslogd instead: there
+	-- is no `logread` command at all and the entries land in /var/log/messages.
+	-- Reading only logread made this page permanently empty on those boxes,
+	-- showing "no log entries" and telling the user to start a service that
+	-- was already running and logging.
+	--
+	-- So: try logread first (correct on stock OpenWrt, and it is the live
+	-- buffer there), then fall back to the file the vendor's syslogd writes.
+	-- The first source that yields anything wins.
+	local sources = {
+		{ cmd = "logread" },
+		{ file = "/var/log/messages" },
+		{ file = "/var/log/syslog" },
+		{ file = "/var/log/messages.1" },
+	}
+
+	local out = ""
+	for _, src in ipairs(sources) do
+		local read
+		if src.cmd then
+			read = src.cmd .. " 2>/dev/null"
+		elseif fs.access(src.file) then
+			read = "cat " .. src.file .. " 2>/dev/null"
+		else
+			read = nil
+		end
+
+		if read then
+			-- The NRadio app store logs every app it installs or opens,
+			-- and its lines name "luci-app-homeproxy" and "sing-box", so
+			-- they match the filter without being anything to do with this
+			-- service. Dropping them is what keeps the window readable.
+			local chunk = sys.exec(
+				read .. " | grep -iE 'homeproxy|sing-box'"
+				     .. " | grep -vi 'appcenter' | tail -n 300")
+			if chunk and chunk ~= "" then
+				out = chunk
+				break
+			end
+		end
+	end
+
+	-- sing-box colours its output, and rsyslogd escapes the ESC byte rather
+	-- than dropping it, so what lands in the file is the literal text
+	-- "#033[36m". Strip both spellings -- a raw ESC and that escaped form --
+	-- because neither belongs in a textarea.
+	out = out:gsub("\27%[[%d;]*m", ""):gsub("#033%[[%d;]*m", "")
+
+	local running = sys.call("pidof sing-box >/dev/null 2>&1") == 0
+%>
+
+<div class="cbi-section">
+<% if out == "" then %>
+	<p><%= running
+		and translate("The service is running, but it has logged nothing at the current log level. Raise it on the settings page if you are debugging.")
+		or translate("No log entries yet. Start the service on the status page.") %></p>
+<% else %>
+	<textarea readonly="readonly" rows="28" wrap="off"
+		style="width:100%;font-family:monospace;font-size:12px;white-space:pre"><%=luci.util.pcdata(out)%></textarea>
+<% end %>
+</div>
+
+<%+footer%>

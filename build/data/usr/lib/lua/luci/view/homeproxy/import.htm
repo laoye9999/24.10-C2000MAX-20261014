@@ -1,0 +1,84 @@
+<%#
+ SPDX-License-Identifier: GPL-2.0
+ Paste-a-link importer.
+
+ Plain HTML on purpose -- see the comment on import_node() in the controller.
+ This firmware swaps CBI widgets out for a client-side JS layer, and a textarea
+ with a submit button is the control that layer handles least predictably.
+-%>
+
+<%+header%>
+
+<h2 name="content"><%:Add Node%></h2>
+
+<div class="cbi-map">
+	<div class="cbi-section">
+		<p class="cbi-value-description">
+			<%:Paste one or more node links below, one per line. Each link is parsed and added as its own node; anything already working is left alone.%>
+		</p>
+
+		<form method="post" action="<%=pcdata(luci.dispatcher.build_url("admin", "services", "homeproxy", "import"))%>">
+			<textarea name="links" rows="12" wrap="off"
+				placeholder="vless://...&#10;trojan://...&#10;ss://..."
+				style="width:100%;box-sizing:border-box;font-family:monospace;font-size:12px;white-space:pre;padding:8px"></textarea>
+
+			<%#
+			 Both controls are sized and coloured inline, and this is the one
+			 place in the package where that is the right answer rather than a
+			 shortcut. The NRadio theme styles `input.cbi-button*` and nothing
+			 else, so on a `<button>` and an `<a>` every cbi-button class here
+			 resolves to nothing: they render as bare text with no background,
+			 border or padding, and the submit button inherits the page's grey
+			 body colour instead of the link blue next to it. Measured with the
+			 theme's own CSS: h2 is 14px, the button was 12px #ced0d1 and the
+			 link 12px #1ab6ff.
+			-%>
+			<div style="margin-top:1em">
+				<button type="submit" class="cbi-button cbi-button-apply"
+					style="font-size:14px;color:#1ab6ff"><%:Import%></button>
+				<a class="cbi-button" href="<%=pcdata(nodes_url)%>"
+					style="font-size:14px;color:#1ab6ff"><%:Back to Node Settings%></a>
+			</div>
+		</form>
+	</div>
+
+	<% if result then %>
+	<div class="cbi-section">
+		<h3><%:Result%></h3>
+		<p>
+			<strong><%:Imported%>:</strong> <%=result.imported%>
+			&nbsp;&nbsp;
+			<strong><%:Failed%>:</strong> <%=result.failed%>
+		</p>
+
+		<% if #result.messages > 0 then %>
+		<table class="table" style="width:100%">
+			<tr>
+				<th style="width:6em"><%:Status%></th>
+				<th><%:Node%></th>
+			</tr>
+			<% for _, m in ipairs(result.messages) do %>
+			<tr>
+				<td>
+					<% if m.ok then %>
+						<span style="color:green">✓</span>
+					<% else %>
+						<span style="color:#b00">✗</span>
+					<% end %>
+				</td>
+				<td style="word-break:break-all"><%=pcdata(m.text)%></td>
+			</tr>
+			<% end %>
+		</table>
+		<% end %>
+
+		<% if result.imported > 0 then %>
+		<p class="cbi-value-description">
+			<%:The service is restarted automatically so the new nodes take effect immediately.%>
+		</p>
+		<% end %>
+	</div>
+	<% end %>
+</div>
+
+<%+footer%>

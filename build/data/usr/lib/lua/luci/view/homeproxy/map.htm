@@ -1,0 +1,14 @@
+<%#
+ SPDX-License-Identifier: GPL-2.0
+ CBI map wrapper: the tab strip, then the running-status widgets when this is
+ the merged status page, then the stock map.
+-%>
+
+<%
+	local disp = require "luci.dispatcher"
+	local here = disp.context.path[#disp.context.path]
+%>
+
+<%+homeproxy/nav%>
+<% if here == "status" then %><%+homeproxy/widgets%><% end %>
+<%+cbi/map%>

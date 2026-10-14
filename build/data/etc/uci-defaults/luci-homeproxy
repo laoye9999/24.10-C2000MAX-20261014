@@ -1,0 +1,41 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# First-install setup for the homeproxy 21.02 backport. Runs once, on install.
+
+[ -f /etc/config/homeproxy ] || exit 0
+
+# The rule sets sing-box loads at startup live here, and node credentials live
+# in the UCI file, so neither should be world readable.
+mkdir -p /etc/homeproxy/rule_set
+chmod 700 /etc/homeproxy
+chmod 600 /etc/config/homeproxy
+
+touch /etc/crontabs/root
+cron_added=0
+add_cron() {
+	grep -qF "$1" /etc/crontabs/root && return 0
+	echo "$2" >> /etc/crontabs/root
+	cron_added=1
+}
+
+# Refresh subscriptions hourly; subscribe.lua decides per subscription whether
+# the configured interval has actually elapsed, so this only needs to run often
+# enough to notice. Deliberately off the hour: every device on the planet
+# schedules its cron at :00.
+add_cron "/usr/lib/lua/homeproxy/subscribe.lua" \
+	"17 * * * * /usr/bin/lua /usr/lib/lua/homeproxy/subscribe.lua >/dev/null 2>&1"
+
+# Same idea for the rule sets, but the script is the thing that knows how stale
+# they are allowed to get (rule_set_interval), so this only has to run
+# occasionally. Six-hourly bounds the lag after a change of interval to six
+# hours, and costs one no-op process four times a day.
+add_cron "/usr/share/homeproxy/update-rule-sets.sh" \
+	"41 */6 * * * /usr/share/homeproxy/update-rule-sets.sh >/dev/null 2>&1"
+
+[ "$cron_added" = "1" ] && { /etc/init.d/cron restart >/dev/null 2>&1 || true; }
+
+# The service is shipped disabled: turning it on reconfigures the firewall, so
+# it should be a deliberate act, not a side effect of installing a package.
+/etc/init.d/homeproxy disable >/dev/null 2>&1
+
+exit 0

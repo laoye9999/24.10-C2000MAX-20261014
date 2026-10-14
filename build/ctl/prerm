@@ -1,0 +1,26 @@
+#!/bin/sh
+# opkg passes "upgrade" or "remove" as $1.
+
+# Drop the firewall rules first, while the script that removes them still
+# exists. Leaving TPROXY rules pointing at a binary that is about to be
+# replaced would black-hole the LAN.
+if [ -x /usr/share/homeproxy/firewall.sh ]; then
+	/usr/share/homeproxy/firewall.sh down >/dev/null 2>&1
+fi
+
+if [ -x /etc/init.d/homeproxy ]; then
+	/etc/init.d/homeproxy stop >/dev/null 2>&1
+fi
+
+# Only forget the boot-time enablement when the package is actually going
+# away. Disabling unconditionally would silently break the user's autostart
+# on every upgrade; postinst re-enables it for the upgrade case.
+case "$1" in
+	remove|purge)
+		if [ -x /etc/init.d/homeproxy ]; then
+			/etc/init.d/homeproxy disable >/dev/null 2>&1
+		fi
+		;;
+esac
+
+exit 0

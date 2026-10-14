@@ -1,0 +1,17 @@
+{
+	"luci-app-homeproxy": {
+		"description": "Grant access to homeproxy configuration",
+		"read": {
+			"uci": [ "homeproxy" ],
+			"file": {
+				"/tmp/homeproxy-subscribe.log": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "homeproxy" ],
+			"file": {
+				"/tmp/homeproxy-subscribe.log": [ "write" ]
+			}
+		}
+	}
+}

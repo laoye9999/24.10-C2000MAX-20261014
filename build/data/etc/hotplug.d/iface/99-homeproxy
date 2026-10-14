@@ -1,0 +1,84 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Re-attach the transparent proxy rules after an interface event.
+#
+# The vendor's eqos service deletes them. /etc/init.d/eqos runs
+#
+#     iptables -t mangle -F PREROUTING
+#
+# in start_service (line 65) and again in stop_service (line 91) -- a bare
+# flush of the *built-in* chain, which takes every rule in it with it, ours
+# included. And /etc/hotplug.d/iface/10-eqos is three lines that call
+# `/etc/init.d/eqos start` on every interface event without ever looking at
+# $ACTION. So a WAN DHCP renew, a modem re-dial or a wifi client joining
+# silently removes the jump while sing-box keeps running and keeps its
+# socket: the service looks healthy, the LuCI page looks healthy, and
+# nothing is proxied.
+#
+# Ordering cannot fix this -- eqos does not run "after" us, it runs later, on
+# an event -- so re-install instead, but only when the rules are actually
+# gone. In the common case this costs one `iptables -C`.
+
+[ -n "$ACTION" ] || exit 0
+
+. /lib/functions.sh
+
+config_load homeproxy
+config_get_bool enabled global enabled 0
+[ "$enabled" = "1" ] || exit 0
+
+# Only while the proxy is *listening*: rules in front of a socket nobody is
+# listening on black-hole the LAN. This mirrors the init script, which refuses
+# to start without the binary for the same reason.
+#
+# This used to test `pidof sing-box`. That is a different question, and it is
+# wrong in exactly the window that matters: stop_service runs stop_guard first,
+# which removes guard.pid, and only then `firewall.sh down` -- and rc.common
+# does not kill the service until stop_service returns, so for that whole
+# interval sing-box is still in the process table with the rules already gone.
+# Every gate below then passes, an interface event in that window re-installs
+# the mangle chain in front of a proxy that is being stopped, and for a plain
+# `stop` nothing ever removes it again: the guard that would pull it is dead,
+# and this hook's later runs see `check` succeed and exit without doing
+# anything. The result is the failure this package is built to avoid -- every
+# LAN flow to a public address TPROXY'd to a closed port, dropped with no RST
+# and no fallback.
+#
+# The port is what TPROXY actually needs, and it disappears the instant the
+# socket does, so test that. Same test the guard makes.
+config_get port inbound tproxy_port 5330
+netstat -lnt 2>/dev/null | grep -q ":$port " || exit 0
+
+# The guard is resident while the service runs, and re-installs the rules it
+# finds missing on its own 10s cycle -- see the watch loop in
+# firewall-guard.sh. So whenever it is alive, this hook is a no-op, including
+# the one case it used to exist for: it is the guard that notices an eqos
+# flush, repairs it, and, more importantly, *doesn't* repair it when the proxy
+# is dead, which this hook could not tell.
+#
+# It is kept for the case where the service is running without a guard -- a
+# guard that has been killed by hand, or one that stopped because the proxy was
+# gone and recovery had run out of attempts. Everything below still holds on
+# its own.
+GUARD_PID=/var/run/homeproxy/guard.pid
+if [ -f "$GUARD_PID" ] && kill -0 "$(cat "$GUARD_PID" 2>/dev/null)" 2>/dev/null; then
+	exit 0
+fi
+
+# Still attached? Nothing to do. This is the path almost every event takes.
+/usr/share/homeproxy/firewall.sh check >/dev/null 2>&1 && exit 0
+
+# One at a time: two events arriving together must not interleave two
+# tear-down/rebuild passes. flock releases on exit, so a crashed run cannot
+# leave this stuck the way a lock directory would.
+exec 9>/var/run/homeproxy-hook.lock 2>/dev/null || exit 0
+flock -n 9 2>/dev/null || exit 0
+
+# Re-check under the lock: the event that beat us here may have re-installed
+# them a moment ago.
+/usr/share/homeproxy/firewall.sh check >/dev/null 2>&1 && exit 0
+
+logger -t homeproxy "interface event: mangle rules were flushed (eqos), reinstalling"
+/usr/share/homeproxy/firewall.sh up >/dev/null 2>&1
+
+exit 0

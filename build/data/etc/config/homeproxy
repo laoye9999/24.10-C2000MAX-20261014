@@ -56,6 +56,23 @@ config inbound 'inbound'
 	option lan_interface 'br-lan'
 	option udp_timeout '5m'
 
+	# 屏蔽 QUIC（UDP 443/80），让 App 回退到 TCP。默认开启。
+	#
+	# 节点是 vmess + ws，隧道本身就是一条 TCP，QUIC 等于「在 TCP 里面再套一层
+	# 丢包恢复」：内层把外层补包造成的乱序当成丢包、自己退避，多条流之间还会
+	# 队头阻塞。实测抖音在节点走 QUIC 时视频和直播播到中间会卡住、每次滑动都
+	# 要等首帧；改为丢弃 UDP 443、逼它走 TCP 后症状消失。TCP 过同一条隧道只有
+	# 一层拥塞控制，能自己恢复。
+	#
+	# 这里用 DROP 而非 REJECT 是被迫的：nftables 不允许 reject 用在
+	# input/forward/output 以外的钩子，而这条链是 `type filter hook prerouting`，
+	# `-j REJECT` 会以 "Invalid argument" 直接装不上。代价是客户端靠超时发现
+	# 失败而不是靠 ICMP——实测浏览器和抖音都在几百毫秒内正常回退。
+	#
+	# 确实需要 QUIC 的场合用 `uci set homeproxy.inbound.block_quic=0` 关掉，
+	# 关掉后 QUIC 会和其他 UDP 流量一样被代理。
+	option block_quic '1'
+
 # 纯界面用途的占位段：LuCI 的 SimpleSection 的 section 是 nil，放 Button /
 # DummyValue 会在保存时崩溃（cbi.lua:1364 attempt to concatenate 'section'）。
 # 订阅页的「全部更新」按钮和结果面板挂在这个真实存在的段上。

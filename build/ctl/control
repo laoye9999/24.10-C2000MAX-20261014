@@ -1,12 +1,12 @@
 Package: luci-app-homeproxy
-Version: 1.0.0-r31
+Version: 1.0.0-r32
 Depends: libc, lua, luci-base, luci-compat, luci-lib-jsonc, libuci-lua, ucode-mod-lua, sing-box, iptables, ip6tables, kmod-nft-tproxy, kmod-ipt-tproxy, kmod-nft-compat, ip-full, curl, ca-bundle
 Source: homeproxy-2410
 SourceName: luci-app-homeproxy
 License: GPL-2.0
 Section: luci
 Architecture: aarch64_cortex-a53
-Installed-Size: 863438
+Installed-Size: 866903
 Description: 走进科学 (HomeProxy, ImmortalWrt 24.10 / firewall4 targets)
  A sing-box based transparent proxy, rewritten natively in Lua for the
  ImmortalWrt 24.10 generation: Lua CBI frontend, Lua configuration
@@ -207,3 +207,35 @@ Description: 走进科学 (HomeProxy, ImmortalWrt 24.10 / firewall4 targets)
  records what `up` actually managed to install, so a half that legitimately
  could not be built does not make `check` fail forever and send the guard into
  a reinstall every ten seconds.
+ .
+ r32 drops QUIC rather than proxying it. The node is vmess over websocket -- one
+ TCP stream per client connection -- so QUIC was being carried inside TCP: a
+ loss-recovery layer inside a loss-recovery layer. The inner one reads the
+ reordering the outer one's repair introduces as loss of its own, backs off, and
+ its streams head-of-line block against each other. Measured on the device with
+ the phone on Douyin: video and live streams stalled mid-playback and every swipe
+ waited on a first frame. A `-p udp --dport 443 -j DROP` ahead of TPROXY, so the
+ app falls back to TCP over the same tunnel, removed both symptoms in a
+ side-by-side test on the live LAN. Port 80 travels with 443 because QUIC is not
+ bound to a port -- it is whatever Alt-Svc advertises. On by default;
+ `uci set homeproxy.inbound.block_quic=0` restores the old behaviour and QUIC is
+ then proxied like any other UDP flow.
+ .
+ It is DROP and not REJECT because it has to be: nftables permits the reject
+ statement only in the input, forward and output hooks, and this chain is
+ `type filter hook prerouting`, so `-j REJECT` fails to install at all with
+ "Invalid argument" -- the first attempt at this change did exactly that. The
+ cost is that a client learns of the failure by timing out rather than by ICMP;
+ every browser and app measured here fell back within a few hundred
+ milliseconds, and nothing got slower.
+ .
+ Two candidates were ruled out along the way, both measured rather than assumed,
+ and neither is in this package. `multiplex` does not work against this node at
+ all: h2mux, yamux and smux each returned connection failures where an otherwise
+ identical no-mux instance returned HTTP 200 -- which is what an Xray server
+ speaking only mux.cool looks like from sing-box. It was tested in throwaway
+ second instances on a spare port, never against the live chain, which is the
+ only reason the experiment was survivable. And `tcp_fast_open` makes no
+ measurable difference on this uplink: five alternating rounds through identical
+ throwaway instances gave a TLS average of 254 ms with it off against 252 ms
+ with it on.

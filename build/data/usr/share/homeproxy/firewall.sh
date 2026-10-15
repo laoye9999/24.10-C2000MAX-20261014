@@ -203,6 +203,42 @@ load_settings() {
 		SKIP_DNS_TCP=0
 	fi
 
+	# --- drop QUIC instead of proxying it? ----------------------------
+	#
+	# On by default, because on this uplink proxying QUIC is strictly worse
+	# than refusing it. Measured on the target device: with the node carrying
+	# QUIC, Douyin's video and live streams stalled mid-playback and every
+	# swipe waited on a first frame; with UDP :443 dropped so the apps fall
+	# back to TCP over the same tunnel, the user's complaint went away.
+	#
+	# The reason is what the tunnel is made of. The node is vmess over
+	# websocket, one TCP stream per client connection, so QUIC is being
+	# carried inside TCP -- a loss-recovery layer inside a loss-recovery
+	# layer. QUIC reads the reordering that the outer TCP repair introduces as
+	# loss of its own, backs off, and its streams head-of-line block against
+	# each other. TCP over the same tunnel has one congestion controller
+	# instead of two, and recovers.
+	#
+	# DROP, not REJECT, and not by preference: nftables refuses the reject
+	# statement outside the input/forward/output hooks, and this chain is
+	# `type filter hook prerouting`, so an iptables `-j REJECT` here fails to
+	# install with "Invalid argument" -- which is how this was found. The
+	# client therefore discovers the failure by timing out rather than by
+	# ICMP, which is why this is off-limits for anything that cannot fail
+	# over: every browser and the apps measured here fall back within a few
+	# hundred milliseconds, and nothing observed got slower.
+	#
+	# Port 80 goes with 443 because QUIC is not bound to 443; it is whatever
+	# the origin advertises in Alt-Svc, and 80 is the other one that shows up.
+	#
+	# Turn it off with `uci set homeproxy.inbound.block_quic=0` if something
+	# genuinely needs QUIC -- it will then be proxied like any other UDP flow.
+	BLOCK_QUIC=$(uget inbound.block_quic 2>/dev/null || echo 1)
+	case "$BLOCK_QUIC" in
+		""|1|on|true|yes|enabled) BLOCK_QUIC=1 ;;
+		*) BLOCK_QUIC=0 ;;
+	esac
+
 	# --- proxy the router's own traffic? ------------------------------
 	#
 	# Opt-in, and off in the shipped default. Turning it on puts an OUTPUT
@@ -410,6 +446,16 @@ build_family() {
 	fi
 	if [ "$SKIP_DNS_TCP" = "1" ]; then
 		ipt_add $tool mangle "$CHAIN" -p tcp --dport 53 -j RETURN
+	fi
+
+	# --- QUIC ---------------------------------------------------------
+	# Must precede TPROXY or it never sees the packet, and must follow the
+	# RETURNs above so that traffic to the router itself is already gone.
+	# See load_settings for why this is DROP, why it is on by default, and
+	# why port 80 travels with 443.
+	if [ "$BLOCK_QUIC" = "1" ]; then
+		ipt_add $tool mangle "$CHAIN" -p udp --dport 443 -j DROP
+		ipt_add $tool mangle "$CHAIN" -p udp --dport 80 -j DROP
 	fi
 
 	# --- TPROXY -------------------------------------------------------

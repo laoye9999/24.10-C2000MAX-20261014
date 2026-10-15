@@ -36,8 +36,14 @@ local DEFAULTS = {
 	-- which it will prefer -- is not proxied at all, so the site simply fails
 	-- instead of falling back to the proxied IPv4 path.
 	ipv6 = true,
-	-- SO_MARK applied to connections the direct outbound originates. Distinct
-	-- from the TPROXY mark (1) so the two never collide.
+	-- SO_MARK applied to every outbound this generator emits -- the nodes as
+	-- well as `direct`. It must differ from the TPROXY mark, which in this
+	-- build is 480 (firewall.sh FWMARK), not the upstream 1.
+	--
+	-- On the node outbounds the mark is load-bearing rather than cosmetic: the
+	-- firewall's OUTPUT chain RETURNs on it, and that is the only thing keeping
+	-- sing-box's own connection to the node out of the transparent proxy. See
+	-- build_outbounds for what happens without it.
 	routing_mark = 2,
 	sniff = true,
 	-- Without this, sing-box sniffs the SNI to *route* the connection but
@@ -91,6 +97,46 @@ end
 local function num(v, fallback)
 	local n = tonumber(v)
 	if n == nil or n <= 0 or n > 65535 then return fallback end
+	return n
+end
+
+--- The SO_MARK every outbound that dials carries, checked.
+---
+--- Checked rather than passed through, because it is free text from a UCI
+--- option and it is load bearing in two directions at once.
+---
+--- Upwards: a value sing-box cannot parse fails config *decode*, and decode
+--- failure is fatal at startup -- procd respawns it five times and then gives
+--- up, which is the "started it and nothing happened" presentation this
+--- package has already shipped twice.
+---
+--- Downwards: firewall.sh RETURNs on exactly this number to keep the tunnel
+--- out of the transparent proxy. 0 is the dangerous one, not because sing-box
+--- rejects it but because it accepts it and means "no mark" -- the firewall's
+--- exclusion would then match nothing, every packet sing-box sends to the node
+--- would be fed back into it, and the box would dial itself at line rate.
+--- The grammar is deliberately narrow: plain decimal, 1..2^31-1.
+---
+--- firewall.sh reads the same option as text and accepts only `[0-9]+` that is
+--- not 0 -- so anything this function accepts for a value the firewall rejects
+--- would be worse than rejecting it here. tonumber() alone would take "0x10"
+--- as 16 and " 7 " as 7; the firewall would fall back to 2 for both, the
+--- generator would mark the tunnel 16, and the exclusion rule -- which matches
+--- on 2 -- would match nothing. That is the loop this whole mechanism exists
+--- to prevent, arrived at by a disagreement over spelling.
+local function routing_mark(cfg)
+	local v = get(cfg.global, "routing_mark")
+
+	local n
+	if type(v) == "number" then
+		n = v
+	elseif type(v) == "string" and v:match("^%d+$") then
+		n = tonumber(v)
+	end
+
+	if n == nil or n < 1 or n > 2147483647 or n ~= math.floor(n) then
+		return DEFAULTS.routing_mark
+	end
 	return n
 end
 
@@ -369,6 +415,23 @@ local function build_outbounds(cfg)
 				if u.to_bool(get(cfg.global, "tcp_fast_open")) then
 					ob.tcp_fast_open = true
 				end
+
+				-- Same SO_MARK the direct outbound carries, and here it is a
+				-- safety property rather than a routing hint.
+				--
+				-- This is the connection to the node itself. The firewall's
+				-- OUTPUT chain captures router-originated traffic by marking it
+				-- and letting the policy route hand it back in over `lo`; if
+				-- this socket were captured too, sing-box's own uplink would be
+				-- redirected into sing-box. That is a loop, and unlike an
+				-- ordinary misconfiguration it does not fail closed -- it
+				-- retries, so it costs the whole box rather than one flow.
+				--
+				-- The firewall RETURNs on this mark before it marks anything,
+				-- and singles out the node's address on top of that. Both have
+				-- to agree with this value.
+				ob.routing_mark = routing_mark(cfg)
+
 				outbounds[#outbounds + 1] = ob
 				tags[#tags + 1] = tag
 			end
@@ -384,7 +447,7 @@ local function build_outbounds(cfg)
 	outbounds[#outbounds + 1] = {
 		type = "direct",
 		tag = "direct",
-		routing_mark = tonumber(get(cfg.global, "routing_mark")) or DEFAULTS.routing_mark,
+		routing_mark = routing_mark(cfg),
 	}
 	outbounds[#outbounds + 1] = { type = "block", tag = "block" }
 

@@ -1,12 +1,12 @@
 Package: luci-app-homeproxy
-Version: 1.0.0-r30
+Version: 1.0.0-r31
 Depends: libc, lua, luci-base, luci-compat, luci-lib-jsonc, libuci-lua, ucode-mod-lua, sing-box, iptables, ip6tables, kmod-nft-tproxy, kmod-ipt-tproxy, kmod-nft-compat, ip-full, curl, ca-bundle
 Source: homeproxy-2410
 SourceName: luci-app-homeproxy
 License: GPL-2.0
 Section: luci
 Architecture: aarch64_cortex-a53
-Installed-Size: 149646
+Installed-Size: 863438
 Description: 走进科学 (HomeProxy, ImmortalWrt 24.10 / firewall4 targets)
  A sing-box based transparent proxy, rewritten natively in Lua for the
  ImmortalWrt 24.10 generation: Lua CBI frontend, Lua configuration
@@ -149,3 +149,61 @@ Description: 走进科学 (HomeProxy, ImmortalWrt 24.10 / firewall4 targets)
  before the section's Add button rather than past it. And the whole list opens
  or closes from one button that always offers whichever action the list is not
  already in.
+ .
+ r31 adds `self_proxy`: capturing the traffic the *router itself* originates,
+ not only what the LAN forwards. Measured on the device before the change,
+ every rule lived in `mangle PREROUTING` behind `-i br-lan`, and both OUTPUT
+ chains were empty -- so the router's own DNS, its NTP and the vendor's cloud
+ bridge all left unproxied, and no amount of "global mode" could have caught
+ them.
+ .
+ The kernel decides the shape of the fix: xt_TPROXY registers for PREROUTING
+ and INPUT only, so `-j TPROXY` in OUTPUT is not a rule that fails at runtime,
+ it is one iptables refuses to accept. What works -- and what this uses -- is
+ what the firmware's own PassWall does: mark the first packet of each new
+ connection in mangle OUTPUT, let the `fwmark 480 -> table 120 -> local dev lo`
+ pair that the forwarded half already installs hand the packet back over the
+ loopback interface, and catch it in a second PREROUTING jump matching
+ `-i lo`, where TPROXY is legal. Every TCP and UDP packet is marked, with no
+ CONNMARK: this firmware's ip6tables has no CONNMARK extension at all, so the
+ usual mark-the-SYN-and-restore design would install cleanly on IPv4, be
+ refused on IPv6, and leave the v6 half marking only the first packet of each
+ flow -- a connection that opens and then stalls. Marking everything needs
+ nothing from conntrack and is what the forwarded half already does. Verified
+ end to end on the target device: with only these rules active the router's own
+ `curl https://api.ipify.org` returned the node's address.
+ .
+ The failure this had to be designed against is a loop. sing-box runs as root,
+ so `-m owner` cannot tell it apart from anything else, and if its own
+ connection to the node were captured it would be handed back to itself and
+ re-dialled at line rate. The discriminator is therefore SO_MARK: the generator
+ now puts `routing_mark` on every outbound that dials, not just on `direct` as
+ before, and the OUTPUT chain RETURNs on that mark before it does anything
+ else -- first rule in the chain, because CONNMARK restore would otherwise
+ overwrite it. A `routing_mark` of 0 is refused rather than obeyed, since
+ sing-box reads it as "no mark" and the exclusion would match nothing.
+ .
+ DNS (53 and 853), NTP (123), the router's own addresses and the private
+ ranges are left direct, unconditionally, on both families. DNS because
+ sing-box resolves the node's hostname through 223.5.5.5 -- putting the
+ resolver behind the tunnel it is needed to reach is a loop by another name;
+ NTP because clock skew breaks the TLS the tunnel is made of. ICMP is left
+ alone too: only TCP SYNs and `udp ctstate NEW` are marked, so ping, PMTU
+ discovery and NDP keep working. The switch is off by default and one
+ `uci set` away. SSH into the box cannot be cut off by a mistake here: that
+ session is inbound, so it never traverses the OUTPUT chain, and its replies
+ are addressed to the LAN, which the returns above cover.
+ .
+ It also fixes a latent bug found while wiring that up. `UCI="uci -q get
+ homeproxy"` followed by `$UCI global.ipv6` splits on the spaces into two
+ arguments, and this uci rejects `uci get <config> <path>` with a usage
+ message -- so *every* option read in firewall.sh had been failing and taking
+ its `|| echo <default>` branch. That went unnoticed only because each default
+ happens to match this device: 5330, br-lan, ipv6 1, dns_hijack 1,
+ routing_mark 2. The settings were inert rather than wrong, and changing
+ tproxy_port in LuCI would have desynchronised the firewall from the generated
+ sing-box config in silence. Reads now go through a helper that passes one
+ argument. The state file `check` consults is new for the same reason: it
+ records what `up` actually managed to install, so a half that legitimately
+ could not be built does not make `check` fail forever and send the guard into
+ a reinstall every ten seconds.

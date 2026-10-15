@@ -83,6 +83,20 @@ o = s:option(Flag, "sniff_override", translate("Sniff Override"),
 o.default = "1"
 o.rmempty = false
 
+-- Declared on the `global` section, because that is where firewall.sh reads it
+-- from (`uci -q get homeproxy.global.self_proxy`). An option declared in the
+-- wrong section is written somewhere nothing reads, which is the dns_hijack /
+-- sniff_override failure spelled out above -- and this one would present as
+-- the switch simply not doing anything.
+o = s:option(Flag, "self_proxy", translate("Proxy Router's Own Traffic"),
+	translate("Capture what the router itself originates, not only what the LAN " ..
+		"forwards. DNS, NTP and the router's own addresses are always left " ..
+		"direct, because the tunnel needs to resolve its node and validate its " ..
+		"own certificates. While this is on, a proxy that is down takes the " ..
+		"router's own connections with it."))
+o.default = "0"
+o.rmempty = false
+
 --------------------------------------------------------------------- inbound
 
 s = m:section(TypedSection, "inbound", translate("Inbound"))

@@ -19,7 +19,7 @@ local sections = {
 		type = "global", enabled = "0", proxy_mode = "rule", default_node = "",
 		log_level = "warn", tcp_fast_open = "1", sniff = "1", sniff_override = "1",
 		ipv6 = "1", dns_hijack = "1", clash_api = "1", clash_port = "9090",
-		routing_mark = "2",
+		routing_mark = "2", self_proxy = "0",
 	},
 	inbound = {
 		type = "inbound", tproxy_port = "5330",

@@ -34,8 +34,10 @@
 ## 回归测试
 
     test/test-firewall-guard.sh          本机直接跑，只用 sh/grep/sleep，27 项
+    test/test-firewall-self.sh           本机直接跑，49 项（r31 新增）
     test/test-confgen.lua                只能在设备上跑（本机没有 lua），5 项
     test/test-confgen-r28.lua            只能在设备上跑，14 项
+    test/test-confgen-r31.lua            只能在设备上跑，7 项（r31 新增）
     test/test-r28-behaviour.sh           只能在设备上跑，21 项
     test/browser/                        节点页 JS 的浏览器测试（见文件里的说明）
 
@@ -349,6 +351,87 @@ header 把 NRadio 自己的导航写死了，只拿 `disp.node_childs` 当判断
     两个节点 + 两节各一个删除按钮 → 排序后逐对检查
                           OK 每个删除按钮仍跟着自己的节点
                           OK 最快的节点排到了最上面
+
+## r30 → r31：让路由器自身的流量也走节点
+
+原来只有 LAN 转发的流量被代理。实测（`conntrack` 里 `src=` 路由器 WAN IP 的流）
+路由器自己发起的全部直连：DNS 223.5.5.5、ntpd、mosquitto 连厂商云
+159.75.189.22:1883 —— 因为规则只挂在 `mangle PREROUTING -i br-lan`，
+而 `mangle OUTPUT` 是空的。
+
+开关是 `homeproxy.global.self_proxy`，默认 `0`。
+
+### 为什么不能直接在 OUTPUT 里 `-j TPROXY`
+
+内核的 `xt_TPROXY` 注册时只声明了 PREROUTING 和 INPUT 两个钩子，OUTPUT 里写
+`-j TPROXY` 不是运行时报错，是 iptables 根本不让你写。可用的是设备上 PassWall
+同款的办法，分两条链：
+
+    CHAIN_OUT (mangle OUTPUT)   给每条新连接的首包打 FWMARK
+    CHAIN_LO  (PREROUTING, -i lo) 收下环回来的包做 TPROXY
+
+打标之后，`fwmark 480 → table 120 → local default dev lo` 那对规则（转发那一半
+本来就在装）会把包送到 lo，包从 lo 重新进入 PREROUTING，在那里 TPROXY 是合法的。
+
+**每条 TCP/UDP 包都打标，不依赖 CONNMARK。** 本来想用「只给 SYN 打标 +
+`CONNMARK --save-mark` / `--restore-mark` 让后续包继承」这种更省事的写法，实测发现
+**这台固件的 ip6tables 根本没有 CONNMARK 扩展**（`-j CONNMARK` 报
+`Chain 'CONNMARK' does not exist`，`--save-mark` 报 `unknown option`），而 v4 有。
+照那样写会：IPv4 装得好好的、IPv6 报错，而 v6 链只标了每条流的第一个包 —— 后续包
+走 WAN 出去，连接握手成功然后卡死。
+
+每包打标不需要 conntrack，而且**转发那一半本来就是这个做法**（LAN 路径的
+`-p tcp -j TPROXY` 同样匹配每个包，全程没有 CONNMARK）。两边一致，也少一层状态。
+
+实测：只装这几条规则时，路由器自己的 `curl https://api.ipify.org` 返回节点地址
+（`x.x.x.x`）；撤掉后直连超时。
+
+### 防死循环靠的是 SO_MARK
+
+sing-box 以 root 跑，`-m owner` 区分不出它。所以改的是 confgen：**每个会拨号的
+outbound** 都带 `routing_mark`（原来只有 `direct` 带），OUTPUT 链第一条规则
+`-m mark --mark <routing_mark> -j RETURN` 把它排除掉。
+
+这条必须是**链里第一条**：后面的 `CONNMARK --restore-mark` 会把包标记覆盖成连接
+标记，放在排除之前就等于把隧道自己的包重新标一遍交给 sing-box —— 那不是一条流
+出错，是 sing-box 自己拨自己，线速重试。
+
+`routing_mark` 的取值文法两边必须完全一致（confgen 的 `routing_mark()` 和
+firewall.sh 里的 `case`）：只收纯十进制、非 0、≤2^31-1。`0` 两边都拒绝，因为
+sing-box 把它读作「不打标」而不是一个值 —— 收下就等于排除规则谁都匹配不上。
+`0x10` 这类也拒绝，因为 `tonumber` 读成 16 而 firewall 读成垃圾，两边一旦对同一个
+值给出不同解释，就是死循环。
+
+### 始终直连的部分（刻意）
+
+- **DNS 53 / 853**：sing-box 要用 223.5.5.5 解析节点域名，把解析器本身放进隧道
+  就是自举死循环。853 是防 DNS-over-TLS 上游的变体。
+- **NTP 123**：时间跳变让 TLS 校验失败，包括隧道那段 TLS。
+- **本机地址 + 保留网段**：两族都排除。SSH 进来走的是 INPUT、根本不经过这条链，
+  而它的回包目标是 LAN 地址、落在保留网段里被 RETURN —— 所以自锁在结构上不可能。
+  这也是「改坏了还能连进去改回来」的依据。
+- **ICMP / ICMPv6**：打标只匹配 tcp/udp，所以 ping、PMTU、NDP 全都不碰。
+
+### 顺带修掉的既有 bug
+
+`UCI="uci -q get homeproxy"` 后面接 `$UCI global.ipv6`，变量按空格拆开后变成
+**两个参数**，而这台设备的 uci 对 `uci get <config> <path>` 这种形式直接打印
+usage 退出。也就是说 firewall.sh 里**每一次选项读取都是失败的**，全部走了
+`|| echo <默认值>`。没暴露是因为默认值恰好都对：5330、br-lan、ipv6 1、
+dns_hijack 1、routing_mark 2 —— 设置一直是「不起作用」而不是「错」。现在改成
+`uget` 辅助函数，单参数。
+
+新增的状态文件 `/var/run/homeproxy/firewall-state` 是同一个问题的另一半：
+它记录 `up` **实际**装上了哪些半边，`check` 只按这个来查。否则某个半边装不上
+（比如 v6 模块没加载）会让 `check` 永远失败，看门狗每 10 秒重装一次，
+而每次重装都会先把能用的 IPv4 规则拆掉 —— LAN 每 10 秒漏一次，比缺那半边更糟。
+
+### 反向对照
+
+去掉 confgen 里那行 `ob.routing_mark = routing_mark(cfg)` 再跑
+`test-confgen-r31.lua`，正好 3 条断言失败、其余通过 —— 而且 `sing-box check`
+**依然接受**那份配置。也就是说这个修复没有任何运行时信号兜底，测试套件是唯一
+守着它的东西。
 
 ## 改配置后自测（在设备上跑，不动真实流量）
 

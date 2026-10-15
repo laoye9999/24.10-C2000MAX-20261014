@@ -7,3 +7,6 @@
 # Earlier builds, kept locally only
 old/
 luci-app-homeproxy_1.0.0-r23_aarch64_cortex-a53.ipk
+
+# Distribution folder, local only
+免流全局代理HY/

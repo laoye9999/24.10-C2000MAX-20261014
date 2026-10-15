@@ -31,8 +31,25 @@ config global 'global'
 	# Clash API，LuCI 状态页和节点切换靠它
 	option clash_api '1'
 	option clash_port '9090'
-	# direct 出口的 SO_MARK；与 TPROXY 的 mark(1) 必须不同
+	# 每个会对外拨号的 outbound（节点和 direct）的 SO_MARK。
+	#
+	# 必须和 TPROXY 的 mark 不同 —— 这个版本里 TPROXY 用的是 480
+	# （firewall.sh 的 FWMARK），不是上游的 1。两者相同的话，firewall.sh 里
+	# 那条「排除 sing-box 自己流量」的 RETURN 会匹配到它自己刚打的标，
+	# 结果是静默地什么都不代理；脚本检测到这个冲突会直接关掉 self_proxy。
 	option routing_mark '2'
+
+	# 路由器自身发起的流量也走代理（不只是 LAN 转发的）。
+	#
+	# 默认关。打开之后，本机发起的连接 —— 订阅更新、厂商云的心跳、opkg ——
+	# 都会经过节点。DNS(53/853)、NTP(123)、本机地址和保留网段始终直连：
+	# sing-box 要用 223.5.5.5 解析节点域名，把解析器本身放进隧道就是自举死循环；
+	# 时间跳变会让 TLS 校验失败，包括隧道那一段 TLS。
+	#
+	# 实现方式见 firewall.sh 里的 CHAIN_OUT/CHAIN_LO：内核的 TPROXY 目标不允许
+	# 用在 OUTPUT 链，所以本机流量是在 mangle OUTPUT 打标，由策略路由送回 lo，
+	# 再从 PREROUTING 的 `-i lo` 进入 TPROXY。
+	option self_proxy '0'
 
 config inbound 'inbound'
 	option tproxy_port '5330'

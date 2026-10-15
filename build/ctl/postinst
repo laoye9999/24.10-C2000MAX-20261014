@@ -16,6 +16,17 @@ if [ -f /etc/config/homeproxy ]; then
 		uci commit homeproxy >/dev/null 2>&1
 	}
 
+	# And the self-proxy switch, which was added after the first installs.
+	# Specifically the *default* is brought forward, and only when the option
+	# is absent: someone who turned it on and confirmed it must not have it
+	# turned back off by an upgrade. Absent is not the same as empty -- the
+	# generator and firewall.sh both read a missing option as off, so an
+	# install that never gets this line behaves exactly like one that does.
+	uci -q get homeproxy.global.self_proxy >/dev/null 2>&1 || {
+		uci set homeproxy.global.self_proxy='0' >/dev/null 2>&1
+		uci commit homeproxy >/dev/null 2>&1
+	}
+
 	# Same conffile problem for the rule-set base. An install that predates the
 	# local-file change still points at cdn.jsdelivr.net, which is RST'd here,
 	# so the remote fallback would be dead on arrival. Only the known-bad value

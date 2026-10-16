@@ -16,9 +16,14 @@
 #      sing-box dialling itself at line rate.
 #   2. The OUTPUT chain must not be built at all unless asked. It is the one
 #      piece here that can leave the box unable to reach anything new.
-#   3. DNS and NTP must be RETURNed. Without :53 the resolver the tunnel needs
-#      to find its own node is itself behind the tunnel; without :123 a skewed
-#      clock breaks TLS, including the TLS the tunnel is made of.
+#   3. DNS and NTP follow global.full_tunnel, which is on by default. Leaving
+#      them direct is what the bootstrap hazard argues for -- the resolver the
+#      tunnel needs to find its own node must not sit behind the tunnel -- but
+#      leaving them direct is also billed traffic, since the node's disguise
+#      only covers what is inside the tunnel. The hazard is answered by the
+#      routing_mark RETURN in 1, not by these rules, which is why the option
+#      can be on by default; the test asserts both directions so that turning
+#      it back off is a thing that was checked rather than assumed.
 #   4. down has to remove all of it, or the box keeps an OUTPUT rule nobody
 #      can see and nobody remembers installing.
 #
@@ -120,6 +125,7 @@ case "$1" in
 	homeproxy.global.dns_hijack)        echo "1" ;;
 	homeproxy.global.self_proxy)        echo "${HP_SELF:-0}" ;;
 	homeproxy.global.routing_mark)      echo "${HP_RMARK:-2}" ;;
+	homeproxy.global.full_tunnel)       echo "${HP_FULL_TUNNEL:-1}" ;;
 	dhcp.@dnsmasq\[0\].dns_redirect|"dhcp.@dnsmasq[0].dns_redirect") echo "1" ;;
 	*) exit 1 ;;
 esac
@@ -163,6 +169,7 @@ run() {
 	STATE="$STATE" PATH="$PATH" \
 	HP_PORT="${HP_PORT:-}" HP_IPV6="${HP_IPV6:-}" \
 	HP_SELF="${HP_SELF:-}" HP_RMARK="${HP_RMARK:-}" \
+	HP_FULL_TUNNEL="${HP_FULL_TUNNEL:-}" \
 	HP_FAIL_MATCH="${HP_FAIL_MATCH:-}" \
 	sh "$FIREWALL" "$@" >>"$STATE/log" 2>&1
 	echo $?
@@ -279,15 +286,42 @@ test_every_packet_is_marked_and_nothing_else_is() {
 	expect "no icmpv6 rule" "0" "$(chain_rules ip6tables HOMEPROXY_OUT | grep -c -e 'ipv6-icmp')"
 }
 
-test_dns_and_ntp_are_returned() {
+test_dns_and_ntp_follow_full_tunnel() {
+	# full_tunnel is on in the shipped default, and when it is on the router's
+	# own resolver and clock traffic goes *into* the tunnel instead of around
+	# it. That is the point of the option: traffic that bypasses the tunnel
+	# bypasses the node's Host header with it, and is billed. What made the
+	# old RETURNs safe to remove is that the bootstrap loop this file has
+	# always guarded against needs only the *node's* hostname, and sing-box
+	# resolves that through a `direct` outbound carrying routing_mark -- which
+	# rule (a) returns before any of this is reached.
 	HP_SELF=1 run up >/dev/null
-	expect "udp 53 returned"   "1" "$(chain_rules iptables HOMEPROXY_OUT | grep -c -- '-p udp --dport 53 -j RETURN')"
-	expect "tcp 53 returned"   "1" "$(chain_rules iptables HOMEPROXY_OUT | grep -c -- '-p tcp --dport 53 -j RETURN')"
-	expect "tcp 853 returned"  "1" "$(chain_rules iptables HOMEPROXY_OUT | grep -c -- '-p tcp --dport 853 -j RETURN')"
-	expect "udp 123 returned"  "1" "$(chain_rules iptables HOMEPROXY_OUT | grep -c -- '-p udp --dport 123 -j RETURN')"
-	expect "v6 udp 53 returned" "1" "$(chain_rules ip6tables HOMEPROXY_OUT | grep -c -- '-p udp --dport 53 -j RETURN')"
-	expect "v6 tcp 853 returned" "1" "$(chain_rules ip6tables HOMEPROXY_OUT | grep -c -- '-p tcp --dport 853 -j RETURN')"
-	expect "v6 udp 123 returned" "1" "$(chain_rules ip6tables HOMEPROXY_OUT | grep -c -- '-p udp --dport 123 -j RETURN')"
+	expect "on: udp 53 not returned"  "0" "$(chain_rules iptables HOMEPROXY_OUT | grep -c -- '-p udp --dport 53 -j RETURN')"
+	expect "on: tcp 53 not returned"  "0" "$(chain_rules iptables HOMEPROXY_OUT | grep -c -- '-p tcp --dport 53 -j RETURN')"
+	expect "on: tcp 853 not returned" "0" "$(chain_rules iptables HOMEPROXY_OUT | grep -c -- '-p tcp --dport 853 -j RETURN')"
+	expect "on: udp 123 not returned" "0" "$(chain_rules iptables HOMEPROXY_OUT | grep -c -- '-p udp --dport 123 -j RETURN')"
+	expect "on: v6 udp 53 not returned"  "0" "$(chain_rules ip6tables HOMEPROXY_OUT | grep -c -- '-p udp --dport 53 -j RETURN')"
+	expect "on: v6 tcp 853 not returned" "0" "$(chain_rules ip6tables HOMEPROXY_OUT | grep -c -- '-p tcp --dport 853 -j RETURN')"
+	expect "on: v6 udp 123 not returned" "0" "$(chain_rules ip6tables HOMEPROXY_OUT | grep -c -- '-p udp --dport 123 -j RETURN')"
+
+	# Not merely absent -- covered. A rule that vanished without the mark
+	# behind it would drop the query, and a resolver that stops answering is
+	# not obviously better than one that leaks.
+	expect "on: udp still marked" "1" \
+		"$(chain_rules iptables HOMEPROXY_OUT | grep -c -e '^-p udp -j MARK --set-mark 480$')"
+	expect "on: v6 udp still marked" "1" \
+		"$(chain_rules ip6tables HOMEPROXY_OUT | grep -c -e '^-p udp -j MARK --set-mark 480$')"
+
+	# And with the option off the old shape comes back exactly, so nobody has
+	# to reason about what the RETURNs used to be.
+	HP_SELF=1 HP_FULL_TUNNEL=0 run up >/dev/null
+	expect "off: udp 53 returned"   "1" "$(chain_rules iptables HOMEPROXY_OUT | grep -c -- '-p udp --dport 53 -j RETURN')"
+	expect "off: tcp 53 returned"   "1" "$(chain_rules iptables HOMEPROXY_OUT | grep -c -- '-p tcp --dport 53 -j RETURN')"
+	expect "off: tcp 853 returned"  "1" "$(chain_rules iptables HOMEPROXY_OUT | grep -c -- '-p tcp --dport 853 -j RETURN')"
+	expect "off: udp 123 returned"  "1" "$(chain_rules iptables HOMEPROXY_OUT | grep -c -- '-p udp --dport 123 -j RETURN')"
+	expect "off: v6 udp 53 returned"   "1" "$(chain_rules ip6tables HOMEPROXY_OUT | grep -c -- '-p udp --dport 53 -j RETURN')"
+	expect "off: v6 tcp 853 returned"  "1" "$(chain_rules ip6tables HOMEPROXY_OUT | grep -c -- '-p tcp --dport 853 -j RETURN')"
+	expect "off: v6 udp 123 returned"  "1" "$(chain_rules ip6tables HOMEPROXY_OUT | grep -c -- '-p udp --dport 123 -j RETURN')"
 }
 
 test_the_two_halves_exclude_the_same_destinations() {
@@ -428,7 +462,7 @@ CASE_LIST="
 test_self_proxy_off_builds_nothing_in_output
 test_self_proxy_on_builds_both_families
 test_the_singbox_exclusion_comes_first
-test_dns_and_ntp_are_returned
+test_dns_and_ntp_follow_full_tunnel
 test_the_two_halves_exclude_the_same_destinations
 test_every_packet_is_marked_and_nothing_else_is
 test_the_mark_grammar_matches_the_generator

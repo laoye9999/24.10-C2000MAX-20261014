@@ -203,6 +203,37 @@ load_settings() {
 		SKIP_DNS_TCP=0
 	fi
 
+	# --- does anything the router dials get to leave unproxied? -------
+	#
+	# On by default: this is what makes the zero-rating actually total.
+	#
+	# The node's disguise is a Host header on a websocket upgrade, so traffic
+	# only reads as free to the carrier while it is *inside* the tunnel. What
+	# dnsmasq sends upstream is not: it is plain UDP to a public resolver, from
+	# a process that is not sing-box and carries no routing_mark, and until
+	# this option existed the OUTPUT chain RETURNed 53, 853 and 123
+	# unconditionally to keep the tunnel's own bootstrap working. Turning that
+	# off routes dnsmasq's lookups -- and the router's NTP -- through the
+	# tunnel instead, where the same hijack-dns rule that answers LAN queries
+	# answers these. Measured on the device: the LAN's DNS then resolves
+	# through the node, and returns *unpoisoned* answers for blocked domains as
+	# a side effect, because the query now leaves the carrier's network first.
+	#
+	# Cost, measured: a cold lookup goes from ~50 ms to ~100-150 ms. Cached
+	# lookups are unaffected. If the node is down but sing-box is up, name
+	# resolution stops working for the whole LAN -- that is the price of
+	# totality, and it is why this is a switch. A sing-box that is *down*
+	# rather than unreachable does not have this problem: firewall-guard pulls
+	# the entire chain, RETURNs included, so DNS falls back to direct by itself.
+	#
+	# Set `uci set homeproxy.global.full_tunnel=0` to go back to leaving the
+	# router's own DNS, DoT and NTP direct.
+	FULL_TUNNEL=$(uget global.full_tunnel 2>/dev/null || echo 1)
+	case "$FULL_TUNNEL" in
+		""|1|on|true|yes|enabled) FULL_TUNNEL=1 ;;
+		*) FULL_TUNNEL=0 ;;
+	esac
+
 	# --- drop QUIC instead of proxying it? ----------------------------
 	#
 	# On by default, because on this uplink proxying QUIC is strictly worse
@@ -534,10 +565,21 @@ build_output() {
 	# hazard wearing a different port number: the query still has to complete
 	# before anything -- including the tunnel -- can be resolved. Plain :53 is
 	# what this device uses; this costs nothing and closes the variant.
-	ipt_add $tool mangle "$CHAIN_OUT" -p udp --dport 53 -j RETURN || return 1
-	ipt_add $tool mangle "$CHAIN_OUT" -p tcp --dport 53 -j RETURN || return 1
-	ipt_add $tool mangle "$CHAIN_OUT" -p tcp --dport 853 -j RETURN || return 1
-	ipt_add $tool mangle "$CHAIN_OUT" -p udp --dport 123 -j RETURN || return 1
+	#
+	# Gated on full_tunnel, which is on in the shipped default. See
+	# load_settings for what it buys and what it costs. It does NOT reopen the
+	# hazard this comment describes: what needs to resolve before the tunnel
+	# comes up is the *node's* hostname, and sing-box resolves that through
+	# dns-local, whose queries leave through the `direct` outbound -- which
+	# carries routing_mark, and is therefore RETURNed by rule (a) above before
+	# any of this is reached. Only dnsmasq's own upstream queries, which
+	# belong to no marked process, get captured here.
+	if [ "$FULL_TUNNEL" = "0" ]; then
+		ipt_add $tool mangle "$CHAIN_OUT" -p udp --dport 53 -j RETURN || return 1
+		ipt_add $tool mangle "$CHAIN_OUT" -p tcp --dport 53 -j RETURN || return 1
+		ipt_add $tool mangle "$CHAIN_OUT" -p tcp --dport 853 -j RETURN || return 1
+		ipt_add $tool mangle "$CHAIN_OUT" -p udp --dport 123 -j RETURN || return 1
+	fi
 
 	# (d) Mark, do not redirect.
 	#

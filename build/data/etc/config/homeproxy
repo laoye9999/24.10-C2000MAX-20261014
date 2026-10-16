@@ -42,14 +42,32 @@ config global 'global'
 	# 路由器自身发起的流量也走代理（不只是 LAN 转发的）。
 	#
 	# 默认关。打开之后，本机发起的连接 —— 订阅更新、厂商云的心跳、opkg ——
-	# 都会经过节点。DNS(53/853)、NTP(123)、本机地址和保留网段始终直连：
-	# sing-box 要用 223.5.5.5 解析节点域名，把解析器本身放进隧道就是自举死循环；
-	# 时间跳变会让 TLS 校验失败，包括隧道那一段 TLS。
+	# 都会经过节点。本机地址和保留网段始终直连（那些本来就不是公网流量）。
+	#
+	# DNS(53/853)、NTP(123) 是否直连由下面的 full_tunnel 决定，不再是固定的。
+	# 自举不会成环：sing-box 用 223.5.5.5 解析节点域名时走的是 direct 出站，
+	# 而每个会拨号的出站都带 routing_mark，CHAIN_OUT 的第一条规则就把它 RETURN 了，
+	# 所以只有 dnsmasq 自己发起的查询会落到后面的规则上。
 	#
 	# 实现方式见 firewall.sh 里的 CHAIN_OUT/CHAIN_LO：内核的 TPROXY 目标不允许
 	# 用在 OUTPUT 链，所以本机流量是在 mangle OUTPUT 打标，由策略路由送回 lo，
 	# 再从 PREROUTING 的 `-i lo` 进入 TPROXY。
 	option self_proxy '0'
+
+	# 让路由器自己的 DNS(53/853) 和 NTP(123) 也走隧道。默认开。
+	#
+	# 免流的伪装是 websocket 握手里的 Host 头，只有**在隧道里**的流量才算免流。
+	# 而 dnsmasq 发往公共解析器的是明文 UDP，进程不是 sing-box、不带 routing_mark，
+	# 在 full_tunnel 关掉时会被 CHAIN_OUT 的 RETURN 规则放行 —— 那就是一份没免到的流量。
+	# 打开后 dnsmasq 的查询走隧道，由那条既有的 hijack-dns 规则作答，和局域网的
+	# 查询走同一条路。实测副作用是好的：查询离开运营商网络之后再解析，
+	# 被墙域名拿回来的是真实 IP，不再被污染。
+	#
+	# 代价（已实测）：冷查询从 ~50ms 变成 ~100-150ms，缓存命中不受影响。
+	# 风险：节点挂了但 sing-box 还活着时，整个局域网都解析不了域名 —— 这是"全走隧道"
+	# 的固有代价，也是它做成开关的原因。而 sing-box 本身挂掉时没这个问题：
+	# firewall-guard 会把整条链（含这些 RETURN）一起撤掉，DNS 自动回落到直连。
+	option full_tunnel '1'
 
 config inbound 'inbound'
 	option tproxy_port '5330'

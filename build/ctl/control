@@ -1,12 +1,12 @@
 Package: luci-app-homeproxy
-Version: 1.0.0-r32
+Version: 1.0.0-r33
 Depends: libc, lua, luci-base, luci-compat, luci-lib-jsonc, libuci-lua, ucode-mod-lua, sing-box, iptables, ip6tables, kmod-nft-tproxy, kmod-ipt-tproxy, kmod-nft-compat, ip-full, curl, ca-bundle
 Source: homeproxy-2410
 SourceName: luci-app-homeproxy
 License: GPL-2.0
 Section: luci
 Architecture: aarch64_cortex-a53
-Installed-Size: 866903
+Installed-Size: 870496
 Description: 走进科学 (HomeProxy, ImmortalWrt 24.10 / firewall4 targets)
  A sing-box based transparent proxy, rewritten natively in Lua for the
  ImmortalWrt 24.10 generation: Lua CBI frontend, Lua configuration
@@ -239,3 +239,38 @@ Description: 走进科学 (HomeProxy, ImmortalWrt 24.10 / firewall4 targets)
  measurable difference on this uplink: five alternating rounds through identical
  throwaway instances gave a TLS average of 254 ms with it off against 252 ms
  with it on.
+ .
+ r33 adds `full_tunnel`, on by default: the router's own DNS (53 and 853) and
+ NTP (123) now go *through* the tunnel instead of around it. This closes the
+ last billed traffic on the box. The node's disguise is a Host header on a
+ websocket upgrade, so traffic only reads as free to the carrier while it is
+ inside the tunnel -- and dnsmasq's upstream lookups were plain UDP from a
+ process that is not sing-box and carries no routing_mark, which the OUTPUT
+ chain RETURNed unconditionally to keep the tunnel's own bootstrap working.
+ .
+ Removing those RETURNs does not reopen the bootstrap hazard they existed for,
+ and that is the only reason it is safe: what has to resolve before the tunnel
+ comes up is the *node's* hostname, and the generator gives every dialling
+ outbound `routing_mark`, so sing-box's own resolution -- through the `direct`
+ outbound -- is returned by the first rule in the chain, before any of this is
+ reached. Only dnsmasq's queries, which belong to no marked process, are
+ captured. Verified on the device: HOMEPROXY_LO's UDP counter climbs as
+ lookups are made, and blocked domains come back *unpoisoned*, because the
+ query now leaves the carrier's network before it is answered -- the same
+ pollution that sniff_override was compensating for is simply gone at the
+ source. Cold lookups measured 50 ms before against 100-150 ms after on this
+ uplink; cached lookups are unaffected. `uci set homeproxy.global.full_tunnel=0`
+ restores the old behaviour.
+ .
+ Cost when it goes wrong, stated in the option's own comment rather than left
+ to be discovered: a node that is down while sing-box is still up now takes the
+ whole LAN's name resolution with it, where before only the proxied traffic
+ suffered. A sing-box that is *down* does not have this problem --
+ firewall-guard pulls the entire chain, RETURNs included, and DNS falls back to
+ direct by itself.
+ .
+ The regression suite grew a case that asserts the new shape in both
+ directions, including that the queries are still *marked* rather than merely
+ no longer returned. A rule that vanished without the mark behind it would drop
+ the query, and a resolver that stops answering is not obviously better than
+ one that leaks. 66 checks, up from 57.

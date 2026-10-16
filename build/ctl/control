@@ -1,12 +1,12 @@
 Package: luci-app-homeproxy
-Version: 1.0.0-r33
+Version: 1.0.0-r34
 Depends: libc, lua, luci-base, luci-compat, luci-lib-jsonc, libuci-lua, ucode-mod-lua, sing-box, iptables, ip6tables, kmod-nft-tproxy, kmod-ipt-tproxy, kmod-nft-compat, ip-full, curl, ca-bundle
 Source: homeproxy-2410
 SourceName: luci-app-homeproxy
 License: GPL-2.0
 Section: luci
 Architecture: aarch64_cortex-a53
-Installed-Size: 870496
+Installed-Size: 873145
 Description: 走进科学 (HomeProxy, ImmortalWrt 24.10 / firewall4 targets)
  A sing-box based transparent proxy, rewritten natively in Lua for the
  ImmortalWrt 24.10 generation: Lua CBI frontend, Lua configuration
@@ -274,3 +274,40 @@ Description: 走进科学 (HomeProxy, ImmortalWrt 24.10 / firewall4 targets)
  no longer returned. A rule that vanished without the mark behind it would drop
  the query, and a resolver that stops answering is not obviously better than
  one that leaks. 66 checks, up from 57.
+ .
+ r34 adds `live_node`: one node of its own for Douyin's live pulls, while
+ everything else keeps using the selector's default. It exists because
+ "short videos are fine, live has no picture" turned out to be an exit-IP
+ problem, not a tunnel problem, and the two cannot be told apart without
+ splitting them.
+ .
+ The evidence, because it is unusually clean. The phone's connections through
+ one node were all present — webcast API, signing hosts, covers — and the pull
+ connection was simply absent; the room drew its UI and no picture. Ruled out in
+ turn, each by measurement rather than argument: QUIC (disabling the block
+ changed nothing), bandwidth (the tunnel did 8.2 MB/s in the same minute), the
+ CDN edge (two hostnames resolved to adjacent addresses on one edge, and one
+ delivered 4.1 MB while the other trickled), and DNS (the live CDNs resolved to
+ ordinary mainland addresses). What settled it was moving only the exit: the
+ same hostname, `pull-flv-l26.douyincdn.com`, delivered 9 KB in five minutes
+ through one node and 3.4 MB through the other — same phone, same app, same
+ hostname. The phone on cellular data played the same room fine, which is what
+ ruled out the room and the app.
+ .
+ Matching is by domain suffix on the two live-pull hosts only. The short-video
+ CDNs and the image/signing hosts are deliberately not listed: they already
+ work, and moving them would only add a variable. The option takes a node
+ section name and is validated the same way `default_node` is, so a deleted
+ node cannot leave the route pointing at an outbound that no longer exists.
+ .
+ Two things worth knowing from wiring it up. sing-box keeps the selector's
+ choice in `experimental.cache_file`, so a selection made at runtime survives a
+ restart and a `default_node` change will look like it did nothing until the
+ selector is also reset — the route rules are not affected by this, only the
+ selector's default. And the rule only governs connections opened after it is
+ installed; existing flows stay on whatever node carried them.
+ .
+ Verified end to end by constructing the connections: `pull-flv-l26.douyincdn
+ .com` and `pull-flv-l26.douyinliving.com` both chain to the node named in
+ `live_node`, `www.taobao.com` to the selector's. `test-confgen*.lua` pass
+ unchanged (5, 14 and 7 checks).

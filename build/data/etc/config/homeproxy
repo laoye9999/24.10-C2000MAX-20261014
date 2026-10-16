@@ -5,6 +5,18 @@ config global 'global'
 	# direct = 全部直连（只做 DNS 处理）
 	option proxy_mode 'rule'
 	option default_node ''
+	# 让直播拉流的域名单独走一个节点（填 config node 的段名，留空则不启用）。
+	#
+	# 抖音的直播拉流和短视频走的是同一批 CDN 主机，但取流地址是按次下发的、
+	# 边缘会校验，所以会出现「短视频正常、直播只有界面没有画面」：TCP 连上了，
+	# 然后以每秒两三百字节渗流。实测同一个域名 pull-flv-l26.douyincdn.com，
+	# 一个节点五分钟给 9KB，另一个给 3.4MB——同一台手机、同一个 App、
+	# 同一个主机名，唯一的变量是出口。
+	#
+	# 匹配的只有直播拉流那两个后缀（douyincdn.com / douyinliving.com），
+	# 短视频的 CDN（douyinvod.com、zjcdn.com）和图片、签名域名都不在内，
+	# 它们本来就正常，挪动只会引入新变量。
+	option live_node ''
 	option log_level 'warn'
 	option tcp_fast_open '1'
 	option sniff '1'

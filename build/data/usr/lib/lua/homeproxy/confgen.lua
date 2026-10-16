@@ -471,12 +471,32 @@ local function build_outbounds(cfg)
 		}
 	end
 
-	return outbounds, tags
+	return outbounds, tags, tag_of
 end
 
 --------------------------------------------------------------------- route
 
-local function build_route(cfg, node_tags)
+-- Domains that must not share the selector's default node.
+--
+-- Douyin's live pulls are served from the same CDN hosts as its short videos,
+-- but the stream URL is issued per request and the CDN edge enforces it: on a
+-- node whose egress the app has been told to distrust, the TCP connection
+-- establishes and then trickles at a couple of hundred bytes a second -- the
+-- room shows its UI and never a picture. Measured directly: `pull-flv-l26
+-- .douyincdn.com` delivered 9 KB in five minutes through one node and 3.4 MB
+-- through another, same phone, same app, same hostname; only the exit differed.
+-- The short-video path is not affected and is deliberately left alone.
+--
+-- Matching is by suffix on the pull hosts only. `.douyincdn.com` and
+-- `.douyinliving.com` are the live pull side; the short-video CDNs
+-- (`douyinvod.com`, `zjcdn.com`) and the image/signing hosts are not listed
+-- because putting them here would move traffic that already works.
+local LIVE_DOMAINS = {
+	".douyincdn.com",
+	".douyinliving.com",
+}
+
+local function build_route(cfg, node_tags, tag_of)
 	local mode = get(cfg.global, "proxy_mode")
 	local has_proxy = #node_tags > 0
 
@@ -490,6 +510,26 @@ local function build_route(cfg, node_tags)
 
 	-- Never proxy traffic that is already local to the LAN.
 	rules[#rules + 1] = { ip_is_private = true, outbound = "direct" }
+
+	-- Live pulls leave by a node of their own, when one is named. See
+	-- LIVE_DOMAINS for why this is not simply "the same node as everything
+	-- else". Stored as a UCI section name like default_node, and translated
+	-- the same way; an unknown or empty value means the rule is not emitted at
+	-- all, so a node that has been deleted cannot leave the route pointing at
+	-- an outbound that no longer exists.
+	if has_proxy then
+		local raw = get(cfg.global, "live_node")
+		local live = tag_of and (tag_of[raw] or raw) or nil
+		local known = false
+		if live and live ~= "" then
+			for _, t in ipairs(node_tags) do
+				if t == live then known = true end
+			end
+		end
+		if known then
+			rules[#rules + 1] = { domain_suffix = LIVE_DOMAINS, outbound = live }
+		end
+	end
 
 	local final
 	if not has_proxy then
@@ -532,7 +572,7 @@ function M.build(cfg)
 	cfg = cfg or {}
 
 	local mode = get(cfg.global, "proxy_mode")
-	local outbounds, node_tags = build_outbounds(cfg)
+	local outbounds, node_tags, tag_of = build_outbounds(cfg)
 	local has_proxy = #node_tags > 0
 
 	local config = {
@@ -543,7 +583,7 @@ function M.build(cfg)
 		dns = build_dns(cfg, mode, has_proxy),
 		inbounds = build_inbounds(cfg),
 		outbounds = outbounds,
-		route = build_route(cfg, node_tags),
+		route = build_route(cfg, node_tags, tag_of),
 		experimental = {
 			-- Persisted so rule sets survive a reboot instead of being
 			-- re-fetched on every cold start. Rewritten at most once per
